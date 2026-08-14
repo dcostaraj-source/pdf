@@ -267,7 +267,11 @@ export default function Home() {
     function relevantPages(prompt: string, document = active) { if (!document)
         return []; const readable = document.pages.filter(p => p.status === "read" && p.text.trim()); if (isWholeDocumentQuestion(prompt))
         return readable; const lower = prompt.toLowerCase(), stop = new Set(["show", "give", "make", "from", "with", "that", "this", "details", "detail", "transaction", "transactions", "entry", "entries", "table", "please", "payment", "payments", "total", "today"]), terms = (lower.match(/[a-z0-9]{3,}/g) ?? []).filter(term => !stop.has(term)), months: Record<string, string> = { january: "01", february: "02", march: "03", april: "04", may: "05", june: "06", july: "07", august: "08", september: "09", october: "10", november: "11", december: "12" }, month = Object.keys(months).find(name => lower.includes(name)), monthNumber = month ? months[month] : undefined, today = lower.includes("today") ? new Date().toISOString().slice(0, 10) : undefined, ranked = readable.map(p => { const text = p.text.toLowerCase(), termScore = terms.reduce((score, term) => score + (text.includes(term) ? 3 : 0), 0), monthScore = month && monthNumber && (text.includes(month) || new RegExp(`\\b\\d{1,2}[-/.]${monthNumber}[-/.]\\d{2,4}\\b`).test(text) || new RegExp(`\\b\\d{1,2}[-/.](?:${month.slice(0, 3)})[-/.]\\d{2,4}\\b`, "i").test(text)) ? 20 : 0, todayScore = today && (text.includes(today) || text.includes(today.split("-").reverse().join("-")) || text.includes(today.split("-").reverse().join("/"))) ? 20 : 0; return { p, score: termScore + monthScore + todayScore }; }).filter(item => item.score > 0).sort((a, b) => b.score - a.score); if (ranked.length)
-        return ranked.slice(0, 30).map(item => item.p).sort((a, b) => a.page - b.page); return readable.length <= 45 ? readable : readable.slice(0, 45); }
+        return ranked.map(item => item.p).sort((a, b) => a.page - b.page);
+    // Never silently restrict an unclassified question to the beginning of a
+    // document. evidenceBatches() already keeps each API request small, so all
+    // readable pages can be checked without losing the later pages.
+    return readable; }
     function evidenceBatches(pages: PageResult[]) { const batches: PageResult[][] = []; let batch: PageResult[] = [], characters = 0; for (const page of pages) {
         const size = page.text.length + 40;
         if (batch.length && (batch.length >= 8 || characters + size > 36000)) {
