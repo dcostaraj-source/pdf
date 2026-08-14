@@ -1,5 +1,5 @@
 {
-  "name": "a-harish-co-document-intelligence",
+  "name": "harish-acharya-co-document-intelligence",
   "version": "1.0.0",
   "private": true,
   "engines": {
@@ -16,8 +16,7 @@
     "pdfjs-dist": "6.2.108",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "tesseract.js": "7.0.0",
-    "xlsx": "0.18.5"
+    "tesseract.js": "7.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.2.1",

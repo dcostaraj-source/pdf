@@ -126,6 +126,104 @@ export function formatCurrency(value: number) {
   return new Intl.NumberFormat("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
 }
 
+function formatSignedCurrency(value: number) {
+  return `${value >= 0 ? "+" : "-"}${formatCurrency(Math.abs(value))}`;
+}
+
+export type GroupedTotal = {
+  key: string;
+  debit: number;
+  credit: number;
+  net: number;
+  count: number;
+  pages: number[];
+};
+
+function normalizeNarration(text: string) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+const NARRATION_STOPWORDS = new Set([
+  "UPI", "NEFT", "IMPS", "RTGS", "POS", "CHQ", "CHEQUE", "ECS", "NACH",
+  "TRANSFER", "PAYMENT", "TO", "FROM", "A/C", "ACCT", "ACCOUNT", "IFSC", "REF", "TXN",
+]);
+
+/**
+ * Extracts a human-readable counterparty/"head" name from a bank narration.
+ * Indian bank statements follow a handful of common conventions (UPI/NEFT/IMPS/RTGS
+ * references, POS/ATM entries, cheques). Anything that doesn't match a known shape
+ * falls back to a cleaned version of the narration itself, so a transaction is never
+ * dropped from the head-wise table — at worst it is grouped under a broader label
+ * that a CA can rename after a quick look.
+ */
+export function extractHead(description: string): string {
+  const text = normalizeNarration(description);
+  const upper = text.toUpperCase();
+
+  if (/\bATM\b/.test(upper)) return "ATM Withdrawal";
+  if (/\bSALARY\b/.test(upper)) return "Salary";
+  if (/\bINTEREST\b/.test(upper)) return "Interest";
+  if (/\bGST\b/.test(upper) && /\bREFUND\b/.test(upper)) return "Tax Refund";
+
+  if (/[/-]/.test(text)) {
+    const segments = text.split(/[/-]/).map(s => s.trim()).filter(Boolean);
+    const candidates = segments.filter(segment => {
+      const letters = (segment.match(/[A-Za-z]/g) ?? []).length;
+      const digits = (segment.match(/[0-9]/g) ?? []).length;
+      if (letters < 3) return false;
+      if (digits > letters) return false;
+      if (NARRATION_STOPWORDS.has(segment.toUpperCase())) return false;
+      if (segment.includes("@")) return false;
+      return true;
+    });
+    if (candidates.length) {
+      const best = candidates.reduce((longest, current) => (current.length > longest.length ? current : longest));
+      return best.replace(/\s{2,}/g, " ").trim();
+    }
+  }
+
+  const cleaned = text.replace(/\b\d{6,}\b/g, "").replace(/\s+/g, " ").trim();
+  return cleaned.length >= 3 ? cleaned.slice(0, 60) : "Other / Unidentified";
+}
+
+function groupRows(rows: ParsedTransaction[], keyFn: (row: ParsedTransaction) => string): GroupedTotal[] {
+  const groups = new Map<string, GroupedTotal>();
+  for (const row of rows) {
+    const key = keyFn(row) || "Other / Unidentified";
+    const existing = groups.get(key) ?? { key, debit: 0, credit: 0, net: 0, count: 0, pages: [] };
+    if (row.direction === "Dr") existing.debit += row.amount;
+    else existing.credit += row.amount;
+    existing.net = existing.credit - existing.debit;
+    existing.count++;
+    if (!existing.pages.includes(row.page)) existing.pages.push(row.page);
+    groups.set(key, existing);
+  }
+  return [...groups.values()].sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+}
+
+export function groupByHead(rows: ParsedTransaction[]): GroupedTotal[] {
+  return groupRows(rows, row => extractHead(row.description));
+}
+
+export function groupByNarration(rows: ParsedTransaction[]): GroupedTotal[] {
+  return groupRows(rows, row => normalizeNarration(row.description));
+}
+
+export function groupedTotalsAnswer(groups: GroupedTotal[], columnTitle: string, unreadable: number[]) {
+  if (!groups.length) return "No matching readable transactions were found. If the answer may be on a flagged page, review that page before relying on this result.";
+  const totalDebit = groups.reduce((sum, g) => sum + g.debit, 0);
+  const totalCredit = groups.reduce((sum, g) => sum + g.credit, 0);
+  const lines = [
+    `| ${columnTitle} | Debit ₹ | Credit ₹ | Net ₹ |`,
+    "|---|---:|---:|---:|",
+    ...groups.map(g => `| ${g.key.replace(/\|/g, "/")} | ${g.debit ? formatCurrency(g.debit) : "—"} | ${g.credit ? formatCurrency(g.credit) : "—"} | ${formatSignedCurrency(g.net)} |`),
+    `| **TOTAL** | **${formatCurrency(totalDebit)}** | **${formatCurrency(totalCredit)}** | **${formatSignedCurrency(totalCredit - totalDebit)}** |`,
+  ];
+  const summary = [`Grouped into ${groups.length} row${groups.length === 1 ? "" : "s"} from every readable page — nothing sampled or left out.`];
+  if (unreadable.length) summary.push(`Important limitation: ${unreadable.length} page(s) are still flagged and excluded: ${unreadable.join(", ")}.`);
+  return [...lines, "", ...summary].join("\n");
+}
+
 export function transactionAnswer(rows: ParsedTransaction[], prompt: string, unreadable: number[]) {
   const filtered = filterTransactions(rows, prompt);
   if (!filtered.length) return "No matching readable transactions were found. If the answer may be on a flagged page, review that page before relying on this result.";
@@ -144,7 +242,7 @@ export function transactionAnswer(rows: ParsedTransaction[], prompt: string, unr
     `Total credits: INR ${formatCurrency(credit)}.`,
     `Net movement (credits minus debits): INR ${formatCurrency(credit - debit)}.`,
   ];
-  if (filtered.length > visible.length) summary.push(`The on-screen table shows the first ${visible.length} rows; the Excel export includes all ${filtered.length} rows.`);
+  if (filtered.length > visible.length) summary.push(`Only the first ${visible.length} of ${filtered.length} matching rows are shown here. Ask a narrower question (a specific date or month) to see the rest.`);
   if (unreadable.length) summary.push(`Important limitation: ${unreadable.length} page(s) are still flagged and excluded: ${unreadable.join(", ")}.`);
   return [...lines, ...(lines.length ? [""] : []), ...summary].join("\n");
 }

@@ -1,6 +1,6 @@
-# A Harish Co — private document workspace
+# Harish Acharya & Co — private document workspace
 
-This is a private, Netlify-ready Next.js application for reading PDFs, marking unreadable pages, asking DeepSeek questions with page citations, and exporting an Excel review workbook.
+This is a private, Netlify-ready Next.js application for reading PDFs, marking unreadable pages, asking DeepSeek questions with page citations, and building head-wise and narration-wise total reports (downloadable as a styled image or a chart) from every page that was read.
 
 ## What you need
 
@@ -32,9 +32,9 @@ A custom domain is optional. The free `*.netlify.app` address works.
 - Reconcile known totals manually.
 - Confirm unreadable figures are marked for review and never guessed.
 - Confirm answers cite the correct PDF pages.
-- Confirm the Excel output against the source.
+- Confirm the head-wise and narration-wise totals against the source PDF.
 
-The “Candidate Amounts” sheet is a review aid, not finished accounting data. A CA must verify it against the PDF.
+The head-wise and narration-wise reports are a review aid, not finished accounting data. A CA must verify them against the PDF.
 
 ## Important limits
 
@@ -59,7 +59,7 @@ The uploaded PDF is parsed and OCR-read in the user's browser. Relevant extracte
 - Scanned pages are read by Tesseract first and independently checked by PaddleOCR PP-OCRv5.
 - Dates, amounts, debit/credit markers, and identifier-like values must strongly agree before the second engine can clear a doubtful page.
 - A second enhanced Tesseract pass is used when the first readings disagree.
-- The Excel Page Audit records which verification gate accepted each page.
+- The Review Queue in the app shows which pages were flagged and why; every accepted page's verification gate is visible there.
 - PaddleOCR is loaded from `esm.sh` on first scanned-PDF use and its model/runtime files are downloaded from the official package/CDN sources. An internet connection is therefore required for the second OCR engine. If it is unavailable, the app keeps the conservative Tesseract review behavior.
 
 Dual OCR reduces risk but does not prove accounting accuracy. Hari must still review flagged pages and reconcile totals before filing or relying on the output.

@@ -1,6 +1,6 @@
 "use client";
 import { KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { filterTransactions, hasReliableTransactionStructure, isTransactionRequest, parseTransactions, transactionAnswer, transactionConsistency } from "./transaction-utils";
+import { GroupedTotal, formatCurrency, groupByHead, groupByNarration, groupedTotalsAnswer, hasReliableTransactionStructure, isTransactionRequest, parseTransactions, transactionAnswer, transactionConsistency } from "./transaction-utils";
 type PageResult = {
     page: number;
     text: string;
@@ -42,8 +42,9 @@ type ChatMessage = {
     id: string;
     role: "assistant" | "user";
     text: string;
+    exportData?: { groups: GroupedTotal[]; title: string; documentName: string };
 };
-const specialists = [["01", "Page Guard", "Accounts for every page"], ["02", "Dual Local OCR", "Two engines read difficult scans"], ["03", "Financial Guard", "Checks critical values before acceptance"], ["04", "DeepSeek Analyst", "Answers only from PDF evidence"], ["05", "Excel Studio", "Creates a page-audit workbook"]];
+const specialists = [["01", "Page Guard", "Accounts for every page"], ["02", "Dual Local OCR", "Two engines read difficult scans"], ["03", "Financial Guard", "Checks critical values before acceptance"], ["04", "DeepSeek Analyst", "Answers only from PDF evidence"], ["05", "Total Reports", "Head-wise and narration-wise tables, computed from every page"]];
 const welcome: ChatMessage = { id: "welcome", role: "assistant", text: "Welcome. Upload a PDF, then ask me anything about it. I will cite page numbers and tell you when evidence is unclear." };
 function inlineFormat(text: string): ReactNode[] { return text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean).map((part, index) => part.startsWith("**") && part.endsWith("**") ? <strong key={index}>{part.slice(2, -2)}</strong> : part); }
 function AssistantContent({ text }: {
@@ -82,8 +83,8 @@ function AssistantContent({ text }: {
     i++;
 } return <div className="assistantContent">{content}</div>; }
 export default function Home() {
-    const [showSplash, setShowSplash] = useState(true), [documents, setDocuments] = useState<DocumentResult[]>([]), [activeId, setActiveId] = useState<string | null>(null), [question, setQuestion] = useState(""), [messages, setMessages] = useState<ChatMessage[]>([welcome]), [asking, setAsking] = useState(false), [analysisProgress, setAnalysisProgress] = useState(""), [isDragging, setIsDragging] = useState(false), [scanMode, setScanMode] = useState<ScanMode>("fast"), [batchNotice, setBatchNotice] = useState("");
-    const inputRef = useRef<HTMLInputElement>(null), topRef = useRef<HTMLElement>(null), documentsRef = useRef<HTMLElement>(null), reviewRef = useRef<HTMLElement>(null), exportRef = useRef<HTMLElement>(null), chatEndRef = useRef<HTMLDivElement>(null);
+    const [showSplash, setShowSplash] = useState(true), [documents, setDocuments] = useState<DocumentResult[]>([]), [activeId, setActiveId] = useState<string | null>(null), [question, setQuestion] = useState(""), [messages, setMessages] = useState<ChatMessage[]>([welcome]), [asking, setAsking] = useState(false), [analysisProgress, setAnalysisProgress] = useState(""), [scanMode, setScanMode] = useState<ScanMode>("fast"), [batchNotice, setBatchNotice] = useState("");
+    const inputRef = useRef<HTMLInputElement>(null), topRef = useRef<HTMLElement>(null), documentsRef = useRef<HTMLElement>(null), reviewRef = useRef<HTMLElement>(null), chatEndRef = useRef<HTMLDivElement>(null);
     const controlRef = useRef<Record<string, "running" | "paused" | "cancelled">>({}), uploadCounterRef = useRef(0);
     const active = documents.find(doc => doc.id === activeId) ?? documents[0];
     useEffect(() => { const timer = window.setTimeout(() => setShowSplash(false), 5000); return () => window.clearTimeout(timer); }, []);
@@ -97,7 +98,7 @@ export default function Home() {
         setBatchNotice(pdfs.length > 1 ? `Reading PDF ${index + 1} of ${pdfs.length}: ${pdfs[index].name}` : "");
         await processPdf(pdfs[index]);
     } const notice = pdfs.length > 1 ? `All ${pdfs.length} PDFs finished. Open any document to review its result.` : "PDF processing finished."; setBatchNotice(notice); if (typeof Notification !== "undefined" && Notification.permission === "granted")
-        new Notification("A Harish Co", { body: notice }); }
+        new Notification("Harish Acharya & Co", { body: notice }); }
     function updateDocument(id: string, patch: Partial<DocumentResult>) { setDocuments(current => current.map(doc => doc.id === id ? { ...doc, ...patch } : doc)); }
     function persistDocument(doc: DocumentResult) { try {
         localStorage.setItem(`ah-progress:${doc.name}:${doc.size}`, JSON.stringify(doc));
@@ -131,12 +132,33 @@ export default function Home() {
     function financialSanity(text: string) { const markers = text.match(/\b\d[\d,]*\.\d{2}\s*\(?(?:CR|DR)\)?\b/gi) ?? []; const impossible = markers.some(value => !Number.isFinite(Number(value.replace(/\(?(?:cr|dr)\)?/ig, "").replace(/,/g, "").trim()))); return { checked: markers.length, passed: !impossible }; }
     async function renderOcrCanvas(page: Awaited<ReturnType<Awaited<ReturnType<(typeof import("pdfjs-dist"))["getDocument"]>["promise"]>["getPage"]>>, scale: number, enhance: boolean) { const viewport = page.getViewport({ scale }), canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height); const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context)
         throw new Error("Canvas unavailable"); await page.render({ canvas, canvasContext: context, viewport }).promise; if (enhance) {
-        const image = context.getImageData(0, 0, canvas.width, canvas.height), data = image.data;
+        const width = canvas.width, height = canvas.height;
+        const image = context.getImageData(0, 0, width, height), data = image.data;
         for (let i = 0; i < data.length; i += 4) {
             const gray = .299 * data[i] + .587 * data[i + 1] + .114 * data[i + 2], value = Math.max(0, Math.min(255, (gray - 128) * 1.45 + 128));
             data[i] = value;
             data[i + 1] = value;
             data[i + 2] = value;
+        }
+        // Mild unsharp-style sharpen on top of the contrast stretch to recover faint
+        // or slightly blurred strokes before the retry OCR pass. This only ever runs
+        // on the fallback path, so it can only help a page that already failed once.
+        if (width > 2 && height > 2) {
+            const gray = new Uint8ClampedArray(width * height);
+            for (let p = 0; p < gray.length; p++) gray[p] = data[p * 4];
+            const kernel = [0, -0.5, 0, -0.5, 3, -0.5, 0, -0.5, 0];
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    let sum = 0, k = 0;
+                    for (let ky = -1; ky <= 1; ky++)
+                        for (let kx = -1; kx <= 1; kx++)
+                            sum += gray[(y + ky) * width + (x + kx)] * kernel[k++];
+                    const idx = (y * width + x) * 4, value = Math.max(0, Math.min(255, sum));
+                    data[idx] = value;
+                    data[idx + 1] = value;
+                    data[idx + 2] = value;
+                }
+            }
         }
         context.putImageData(image, 0, 0);
     } return canvas; }
@@ -161,87 +183,161 @@ export default function Home() {
             pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
             const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
             updateDocument(id, { totalPages: pdf.numPages });
-            let worker: Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | null = null, paddle: PaddleEngine | null = null, paddleUnavailable = false;
-            const results: PageResult[] = [...(resumable?.pages ?? [])];
-            for (let n = results.length + 1; n <= pdf.numPages; n++) {
-                if (!await waitWhilePaused(id))
-                    break;
-                const page = await pdf.getPage(n), content = await page.getTextContent(), embedded = content.items.map(item => "str" in item ? item.str : "").join(" ").replace(/\s+/g, " ").trim();
-                let result: PageResult;
-                if (embedded.length >= 20)
-                    result = { page: n, text: embedded, method: "embedded text", status: "read", verification: "Source text layer" };
-                else
+
+            // Several pages are OCR'd at once through their own Tesseract worker instead of
+            // one page at a time. Pool size is kept small and capped by both CPU cores and
+            // approximate device memory so this stays safe on modest laptops/phones.
+            const nav = typeof navigator !== "undefined" ? navigator as Navigator & { deviceMemory?: number } : undefined;
+            const cores = nav?.hardwareConcurrency ?? 4, memoryGb = nav?.deviceMemory ?? 8;
+            const poolSize = Math.max(1, Math.min(3, Math.floor(cores / 2), Math.floor(memoryGb / 2)));
+            const workerPool: Array<Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | null> = new Array(poolSize).fill(null);
+            const freeSlots: number[] = Array.from({ length: poolSize }, (_, i) => i);
+            async function getSlotWorker(slot: number) {
+                if (!workerPool[slot]) {
+                    const { createWorker } = await import("tesseract.js");
+                    const created = await createWorker("eng");
+                    await created.setParameters({ preserve_interword_spaces: "1" });
+                    workerPool[slot] = created;
+                }
+                return workerPool[slot]!;
+            }
+
+            // PaddleOCR is a single shared engine (its own model session), so calls to it
+            // are serialized through paddleChain even though Tesseract runs in parallel.
+            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; init: Promise<void> | null; chain: Promise<unknown> } = { engine: null, unavailable: false, init: null, chain: Promise.resolve() };
+            function ensurePaddle() {
+                if (paddleState.engine || paddleState.unavailable)
+                    return Promise.resolve();
+                if (!paddleState.init)
+                    paddleState.init = (async () => {
+                        try {
+                            const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
+                                PaddleOCR: {
+                                    create: (options: Record<string, unknown>) => Promise<PaddleEngine>;
+                                };
+                            }>, { PaddleOCR } = await loadPaddle();
+                            paddleState.engine = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
+                        }
+                        catch {
+                            paddleState.unavailable = true;
+                        }
+                    })();
+                return paddleState.init;
+            }
+            async function runPaddle(canvas: HTMLCanvasElement) {
+                await ensurePaddle();
+                if (!paddleState.engine)
+                    return { text: "", confidence: 0 };
+                const task = paddleState.chain.then(async () => {
+                    const engine = paddleState.engine;
+                    if (!engine)
+                        return { text: "", confidence: 0 };
                     try {
-                        if (!worker) {
-                            const { createWorker } = await import("tesseract.js");
-                            worker = await createWorker("eng");
-                            await worker.setParameters({ preserve_interword_spaces: "1" });
-                        }
-                        const firstScale = initial.mode === "fast" ? 1.55 : 2.0, firstCanvas = await renderOcrCanvas(page, firstScale, false), first = await worker.recognize(firstCanvas), firstText = cleanOcrText(first.data.text);
-                        const sanity = financialSanity(firstText), structured = hasReliableTransactionStructure(firstText), firstConsistency = transactionConsistency(firstText), fastAccepted = firstText.length >= 20 && sanity.passed && (initial.mode === "fast" ? (first.data.confidence >= 72 || (structured && first.data.confidence >= 45 && firstConsistency >= .97)) : first.data.confidence >= 88);
-                        if (fastAccepted) {
-                            result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Fast OCR confidence ${Math.round(first.data.confidence)}%; ${sanity.checked} financial values checked` };
-                            firstCanvas.width = 0;
-                            firstCanvas.height = 0;
-                            page.cleanup();
-                            results.push(result);
-                            const elapsed = (Date.now() - (initial.startedAt ?? Date.now())) / 1000, completedThisRun = Math.max(1, n - (resumable?.processedPages ?? 0)), remaining = pdf.numPages - n, eta = (elapsed / completedThisRun) * remaining;
-                            const snapshot = { ...initial, pages: [...results], totalPages: pdf.numPages, processedPages: n, status: "Processing" as const, etaSeconds: eta };
-                            updateDocument(id, snapshot);
-                            if (n % 5 === 0 || n === pdf.numPages)
-                                persistDocument(snapshot);
-                            continue;
-                        }
-                        let paddleText = "", paddleConfidence = 0;
-                        if (!paddle && !paddleUnavailable)
-                            try {
-                                const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
-                                    PaddleOCR: {
-                                        create: (options: Record<string, unknown>) => Promise<PaddleEngine>;
-                                    };
-                                }>, { PaddleOCR } = await loadPaddle();
-                                paddle = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
-                            }
-                            catch {
-                                paddleUnavailable = true;
-                            }
-                        if (paddle)
-                            try {
-                                const [paddleResult] = await paddle.predict(firstCanvas), normalized = normalizePaddleResult(paddleResult?.items ?? []);
-                                paddleText = normalized.text;
-                                paddleConfidence = normalized.confidence;
-                            }
-                            catch {
-                                paddleUnavailable = true;
-                                await paddle.dispose().catch(() => undefined);
-                                paddle = null;
-                            }
-                        const crossAgreement = tokenAgreement(firstText, paddleText), dualAccepted = firstText.length >= 20 && paddleText.length >= 20 && first.data.confidence >= 58 && paddleConfidence >= 72 && crossAgreement >= (initial.mode === "fast" ? .91 : .96) && sanity.passed;
-                        firstCanvas.width = 0;
-                        firstCanvas.height = 0;
-                        if (dualAccepted)
-                            result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Dual OCR agreement ${Math.round(crossAgreement * 100)}%; ${sanity.checked} financial values checked` };
-                        else {
-                            await worker.setParameters({ tessedit_pageseg_mode: "6" as never, preserve_interword_spaces: "1" });
-                            const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 1.8 : 2.35, true), second = await worker.recognize(enhancedCanvas);
-                            enhancedCanvas.width = 0;
-                            enhancedCanvas.height = 0;
-                            const secondText = cleanOcrText(second.data.text), retryAgreement = tokenAgreement(firstText, secondText), paddleRetryAgreement = Math.max(tokenAgreement(firstText, paddleText), tokenAgreement(secondText, paddleText)), secondConsistency = transactionConsistency(secondText), preferSecond = secondConsistency > firstConsistency || (secondConsistency === firstConsistency && second.data.confidence >= first.data.confidence), best = preferSecond ? second : first, bestText = cleanOcrText(best.data.text), bestSanity = financialSanity(bestText), bestStructured = hasReliableTransactionStructure(bestText), bestConsistency = Math.max(firstConsistency, secondConsistency), legacyAccepted = firstText.length >= 20 && first.data.confidence >= 62 && (!structured || firstConsistency >= .97), retryAccepted = bestText.length >= 20 && ((bestStructured && bestConsistency >= .97 && Math.max(first.data.confidence, second.data.confidence) >= 40) || (Math.max(first.data.confidence, second.data.confidence) >= 55 && retryAgreement >= (bestStructured ? .82 : .9))), verifiedRetry = paddleText.length >= 20 && paddleConfidence >= 68 && paddleRetryAgreement >= .82 && bestSanity.passed, accepted = legacyAccepted || retryAccepted || verifiedRetry;
-                            result = accepted ? { page: n, text: bestText, method: "OCR", status: "read", verification: verifiedRetry ? `Dual OCR retry agreement ${Math.round(paddleRetryAgreement * 100)}%; ${bestSanity.checked} financial values checked` : legacyAccepted ? "Tesseract confidence gate" : "Tesseract retry agreement" } : { page: n, text: bestText, method: "unreadable", status: "review", verification: paddleUnavailable ? "Second OCR unavailable; conservative review" : "OCR engines did not agree on critical values", message: `Sorry, I could not verify the financial values on page ${n}. Please review this page.` };
-                        }
+                        const [paddleResult] = await engine.predict(canvas);
+                        return normalizePaddleResult(paddleResult?.items ?? []);
                     }
                     catch {
-                        result = { page: n, text: "", method: "unreadable", status: "review", message: `Sorry, I could not clearly read page ${n}. Please review this page.` };
+                        paddleState.unavailable = true;
+                        paddleState.engine = null;
+                        await engine.dispose().catch(() => undefined);
+                        return { text: "", confidence: 0 };
                     }
-                page.cleanup();
-                results.push(result);
-                const elapsed = (Date.now() - (initial.startedAt ?? Date.now())) / 1000, completedThisRun = Math.max(1, n - (resumable?.processedPages ?? 0)), eta = (elapsed / completedThisRun) * (pdf.numPages - n), snapshot = { ...initial, pages: [...results], totalPages: pdf.numPages, processedPages: n, status: "Processing" as const, etaSeconds: eta };
-                updateDocument(id, snapshot);
-                if (n % 5 === 0 || n === pdf.numPages)
-                    persistDocument(snapshot);
+                });
+                paddleState.chain = task.then(() => undefined, () => undefined);
+                return task;
             }
-            await worker?.terminate();
-            await paddle?.dispose();
+
+            // Completed pages land here (possibly out of order); emit() only advances the
+            // persisted/visible results by the longest unbroken prefix from page 1, so resume
+            // and the final missing-page check never see a gap.
+            const resultsMap = new Map<number, PageResult>();
+            (resumable?.pages ?? []).forEach(p => resultsMap.set(p.page, p));
+            const results: PageResult[] = [...(resumable?.pages ?? [])];
+            let emittedThrough = results.length, lastPersisted = emittedThrough;
+            function emit() {
+                let advanced = false;
+                while (resultsMap.has(emittedThrough + 1)) {
+                    results.push(resultsMap.get(emittedThrough + 1)!);
+                    emittedThrough++;
+                    advanced = true;
+                }
+                if (!advanced)
+                    return;
+                const elapsed = (Date.now() - (initial.startedAt ?? Date.now())) / 1000, completedThisRun = Math.max(1, emittedThrough - (resumable?.processedPages ?? 0)), eta = (elapsed / completedThisRun) * (pdf.numPages - emittedThrough);
+                const snapshot = { ...initial, pages: [...results], totalPages: pdf.numPages, processedPages: emittedThrough, status: "Processing" as const, etaSeconds: eta };
+                updateDocument(id, snapshot);
+                if (emittedThrough - lastPersisted >= 5 || emittedThrough === pdf.numPages) {
+                    persistDocument(snapshot);
+                    lastPersisted = emittedThrough;
+                }
+            }
+
+            async function readPage(n: number, slot: number) {
+                const page = await pdf.getPage(n), content = await page.getTextContent(), embedded = content.items.map(item => "str" in item ? item.str : "").join(" ").replace(/\s+/g, " ").trim();
+                let result: PageResult;
+                if (embedded.length >= 20) {
+                    result = { page: n, text: embedded, method: "embedded text", status: "read", verification: "Source text layer" };
+                    page.cleanup();
+                    resultsMap.set(n, result);
+                    emit();
+                    return;
+                }
+                try {
+                    const worker = await getSlotWorker(slot);
+                    const firstScale = initial.mode === "fast" ? 1.7 : 2.2, firstCanvas = await renderOcrCanvas(page, firstScale, false), first = await worker.recognize(firstCanvas), firstText = cleanOcrText(first.data.text);
+                    const sanity = financialSanity(firstText), structured = hasReliableTransactionStructure(firstText), firstConsistency = transactionConsistency(firstText), fastAccepted = firstText.length >= 20 && sanity.passed && (initial.mode === "fast" ? (first.data.confidence >= 72 || (structured && first.data.confidence >= 45 && firstConsistency >= .97)) : first.data.confidence >= 88);
+                    if (fastAccepted) {
+                        result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Fast OCR confidence ${Math.round(first.data.confidence)}%; ${sanity.checked} financial values checked` };
+                        firstCanvas.width = 0;
+                        firstCanvas.height = 0;
+                        page.cleanup();
+                        resultsMap.set(n, result);
+                        emit();
+                        return;
+                    }
+                    const paddleOutcome = await runPaddle(firstCanvas), paddleText = paddleOutcome.text, paddleConfidence = paddleOutcome.confidence;
+                    const crossAgreement = tokenAgreement(firstText, paddleText), dualAccepted = firstText.length >= 20 && paddleText.length >= 20 && first.data.confidence >= 58 && paddleConfidence >= 72 && crossAgreement >= (initial.mode === "fast" ? .91 : .96) && sanity.passed;
+                    firstCanvas.width = 0;
+                    firstCanvas.height = 0;
+                    if (dualAccepted)
+                        result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Dual OCR agreement ${Math.round(crossAgreement * 100)}%; ${sanity.checked} financial values checked` };
+                    else {
+                        await worker.setParameters({ tessedit_pageseg_mode: "6" as never, preserve_interword_spaces: "1" });
+                        const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 2.1 : 2.6, true), second = await worker.recognize(enhancedCanvas);
+                        enhancedCanvas.width = 0;
+                        enhancedCanvas.height = 0;
+                        const secondText = cleanOcrText(second.data.text), retryAgreement = tokenAgreement(firstText, secondText), paddleRetryAgreement = Math.max(tokenAgreement(firstText, paddleText), tokenAgreement(secondText, paddleText)), secondConsistency = transactionConsistency(secondText), preferSecond = secondConsistency > firstConsistency || (secondConsistency === firstConsistency && second.data.confidence >= first.data.confidence), best = preferSecond ? second : first, bestText = cleanOcrText(best.data.text), bestSanity = financialSanity(bestText), bestStructured = hasReliableTransactionStructure(bestText), bestConsistency = Math.max(firstConsistency, secondConsistency), legacyAccepted = firstText.length >= 20 && first.data.confidence >= 62 && (!structured || firstConsistency >= .97), retryAccepted = bestText.length >= 20 && ((bestStructured && bestConsistency >= .97 && Math.max(first.data.confidence, second.data.confidence) >= 40) || (Math.max(first.data.confidence, second.data.confidence) >= 55 && retryAgreement >= (bestStructured ? .82 : .9))), verifiedRetry = paddleText.length >= 20 && paddleConfidence >= 68 && paddleRetryAgreement >= .82 && bestSanity.passed, accepted = legacyAccepted || retryAccepted || verifiedRetry;
+                        result = accepted ? { page: n, text: bestText, method: "OCR", status: "read", verification: verifiedRetry ? `Dual OCR retry agreement ${Math.round(paddleRetryAgreement * 100)}%; ${bestSanity.checked} financial values checked` : legacyAccepted ? "Tesseract confidence gate" : "Tesseract retry agreement" } : { page: n, text: bestText, method: "unreadable", status: "review", verification: paddleState.unavailable ? "Second OCR unavailable; conservative review" : "OCR engines did not agree on critical values", message: `Sorry, I could not verify the financial values on page ${n}. Please review this page.` };
+                    }
+                }
+                catch {
+                    result = { page: n, text: "", method: "unreadable", status: "review", message: `Sorry, I could not clearly read page ${n}. Please review this page.` };
+                }
+                page.cleanup();
+                resultsMap.set(n, result);
+                emit();
+            }
+
+            let cursor = results.length + 1, firstError: unknown = null;
+            const inFlight = new Map<number, Promise<void>>();
+            while ((cursor <= pdf.numPages || inFlight.size) && !firstError) {
+                if (!await waitWhilePaused(id))
+                    break;
+                while (inFlight.size < poolSize && cursor <= pdf.numPages && freeSlots.length && !firstError) {
+                    const n = cursor++, slot = freeSlots.pop()!;
+                    const task = readPage(n, slot).catch(err => { firstError = firstError ?? err; }).finally(() => { inFlight.delete(n); freeSlots.push(slot); });
+                    inFlight.set(n, task);
+                }
+                if (!inFlight.size)
+                    break;
+                await Promise.race(inFlight.values());
+            }
+            await Promise.allSettled(inFlight.values());
+            for (const worker of workerPool)
+                await worker?.terminate();
+            await paddleState.engine?.dispose();
+            if (firstError)
+                throw firstError;
             if (wasCancelled(id))
                 return;
             const accounted = new Set(results.map(page => page.page)), missing = Array.from({ length: pdf.numPages }, (_, index) => index + 1).filter(page => !accounted.has(page));
@@ -264,10 +360,22 @@ export default function Home() {
     }
     function isWholeDocumentQuestion(prompt: string) { return /summari|overview|\bevery\b|\ball\b|whole|entire|complete document|excel|export/i.test(prompt); }
     function resolveDocument(prompt: string) { const number = prompt.match(/\b(?:pdf|document|file)\s*#?\s*(\d+)\b/i)?.[1], byNumber = number ? documents.find(document => document.uploadNumber === Number(number)) : undefined, lower = prompt.toLowerCase(), byName = documents.find(document => lower.includes(document.name.toLowerCase()) || lower.includes(document.name.replace(/\.pdf$/i, "").toLowerCase())); return byName ?? byNumber ?? active; }
+    function explicitlyReferencedPages(prompt: string) { const lower = prompt.toLowerCase(), pages = new Set<number>(); for (const match of lower.matchAll(/\b(?:page|pg\.?|p\.)\s*#?\s*(\d{1,4})\b/g))
+        pages.add(Number(match[1])); const ordinals: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10 }; for (const [word, n] of Object.entries(ordinals))
+        if (new RegExp(`\\b${word}\\s+page\\b`).test(lower))
+            pages.add(n); return pages; }
     function relevantPages(prompt: string, document = active) { if (!document)
         return []; const readable = document.pages.filter(p => p.status === "read" && p.text.trim()); if (isWholeDocumentQuestion(prompt))
-        return readable; const lower = prompt.toLowerCase(), stop = new Set(["show", "give", "make", "from", "with", "that", "this", "details", "detail", "transaction", "transactions", "entry", "entries", "table", "please", "payment", "payments", "total", "today"]), terms = (lower.match(/[a-z0-9]{3,}/g) ?? []).filter(term => !stop.has(term)), months: Record<string, string> = { january: "01", february: "02", march: "03", april: "04", may: "05", june: "06", july: "07", august: "08", september: "09", october: "10", november: "11", december: "12" }, month = Object.keys(months).find(name => lower.includes(name)), monthNumber = month ? months[month] : undefined, today = lower.includes("today") ? new Date().toISOString().slice(0, 10) : undefined, ranked = readable.map(p => { const text = p.text.toLowerCase(), termScore = terms.reduce((score, term) => score + (text.includes(term) ? 3 : 0), 0), monthScore = month && monthNumber && (text.includes(month) || new RegExp(`\\b\\d{1,2}[-/.]${monthNumber}[-/.]\\d{2,4}\\b`).test(text) || new RegExp(`\\b\\d{1,2}[-/.](?:${month.slice(0, 3)})[-/.]\\d{2,4}\\b`, "i").test(text)) ? 20 : 0, todayScore = today && (text.includes(today) || text.includes(today.split("-").reverse().join("-")) || text.includes(today.split("-").reverse().join("/"))) ? 20 : 0; return { p, score: termScore + monthScore + todayScore }; }).filter(item => item.score > 0).sort((a, b) => b.score - a.score); if (ranked.length)
-        return ranked.map(item => item.p).sort((a, b) => a.page - b.page);
+        return readable;
+    // A question can name a specific page ("what is on page 2", "the second page")
+    // that the keyword scoring below has no way to match against page content. Any
+    // such page, if it was actually read, is guaranteed to be included below rather
+    // than risk a false "could not read" answer for a page that reads fine.
+    const explicitPages = explicitlyReferencedPages(prompt), explicitMatches = readable.filter(p => explicitPages.has(p.page));
+    const lower = prompt.toLowerCase(), stop = new Set(["show", "give", "make", "from", "with", "that", "this", "details", "detail", "transaction", "transactions", "entry", "entries", "table", "please", "payment", "payments", "total", "today"]), terms = (lower.match(/[a-z0-9]{3,}/g) ?? []).filter(term => !stop.has(term)), months: Record<string, string> = { january: "01", february: "02", march: "03", april: "04", may: "05", june: "06", july: "07", august: "08", september: "09", october: "10", november: "11", december: "12" }, month = Object.keys(months).find(name => lower.includes(name)), monthNumber = month ? months[month] : undefined, today = lower.includes("today") ? new Date().toISOString().slice(0, 10) : undefined, ranked = readable.map(p => { const text = p.text.toLowerCase(), termScore = terms.reduce((score, term) => score + (text.includes(term) ? 3 : 0), 0), monthScore = month && monthNumber && (text.includes(month) || new RegExp(`\\b\\d{1,2}[-/.]${monthNumber}[-/.]\\d{2,4}\\b`).test(text) || new RegExp(`\\b\\d{1,2}[-/.](?:${month.slice(0, 3)})[-/.]\\d{2,4}\\b`, "i").test(text)) ? 20 : 0, todayScore = today && (text.includes(today) || text.includes(today.split("-").reverse().join("-")) || text.includes(today.split("-").reverse().join("/"))) ? 20 : 0; return { p, score: termScore + monthScore + todayScore }; }).filter(item => item.score > 0).sort((a, b) => b.score - a.score);
+    if (ranked.length || explicitMatches.length) { const merged = ranked.map(item => item.p); for (const p of explicitMatches)
+        if (!merged.includes(p))
+            merged.push(p); return merged.sort((a, b) => a.page - b.page); }
     // Never silently restrict an unclassified question to the beginning of a
     // document. evidenceBatches() already keeps each API request small, so all
     // readable pages can be checked without losing the later pages.
@@ -301,7 +409,7 @@ export default function Home() {
         const parsed = document.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
         if (isTransactionRequest(clean) && parsed.length) {
             const answer = transactionAnswer(parsed, clean, unreadable);
-            setMessages(c => [...c, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${document.name}\n\n${answer}${wantsExcel ? "\n\nSelect Table to Excel to download all matching rows." : ""}` }]);
+            setMessages(c => [...c, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${document.name}\n\n${answer}` }]);
             return;
         }
         const answers: string[] = [];
@@ -315,8 +423,6 @@ export default function Home() {
             const synthesisPages = answers.map((text, index) => ({ page: index + 1, text, method: "embedded text" as const, status: "read" as const }));
             answer = await requestAnswer(`Original request: ${analysisPrompt}\n\nCombine and verify the partial findings below. Recalculate totals from the listed rows and report any disagreement.`, synthesisPages, unreadable, undefined, true, document);
         }
-        if (wantsExcel && /^\|.+\|/m.test(answer))
-            answer += `\n\nYour table is ready. Select Table to Excel above to download the Excel file.`;
         setMessages(c => [...c, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${document.name}\n\n${answer}` }]);
     }
     catch (error) {
@@ -330,68 +436,205 @@ export default function Home() {
         e.preventDefault();
         askQuestion();
     } }
-    async function exportLegacyExcel() { if (!active || active.status === "Processing")
-        return; const XLSX = await import("xlsx"), rows = active.pages.map(p => ({ Document: active.name, Page: p.page, "Reading method": p.method, "Verification status": p.status === "read" ? "Read" : "Human review required", "Extracted text": p.text, "System message": p.message ?? "" })), amounts = active.pages.flatMap(p => (p.text.match(/(?:₹|Rs\.?|INR\s*)?\s*\(?-?\d[\d,]*(?:\.\d{1,2})?\)?/gi) ?? []).filter(v => /[₹,\.]|Rs|INR/i.test(v)).map(v => ({ Document: active.name, Page: p.page, "Candidate amount": v.trim(), Status: "Verify against source PDF" }))), book = XLSX.utils.book_new(), sheet = XLSX.utils.json_to_sheet(rows), amountSheet = XLSX.utils.json_to_sheet(amounts); sheet["!cols"] = [{ wch: 35 }, { wch: 8 }, { wch: 18 }, { wch: 24 }, { wch: 90 }, { wch: 55 }]; amountSheet["!cols"] = [{ wch: 35 }, { wch: 8 }, { wch: 24 }, { wch: 30 }]; XLSX.utils.book_append_sheet(book, sheet, "Page Audit"); XLSX.utils.book_append_sheet(book, amountSheet, "Candidate Amounts"); XLSX.writeFile(book, `${active.name.replace(/\.pdf$/i, "")}-audit.xlsx`); }
-    void exportLegacyExcel;
-    async function exportExcel() {
-        if (!active || active.status === "Processing")
-            return;
-        const XLSX = await import("xlsx");
-        const rows = active.pages.map(p => ({ Document: active.name, Page: p.page, "Reading method": p.method, "Verification status": p.status === "read" ? "Read" : "Human review required", "Extracted text": p.text, "System message": p.message ?? "" }));
-        const transactions = active.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page)).map(row => ({ Date: row.date, "Transaction ID": row.transactionId, Description: row.description, Debit: row.direction === "Dr" ? row.amount : null, Credit: row.direction === "Cr" ? row.amount : null, Balance: row.balance, "Balance direction": row.balanceDirection, "Source page": row.page }));
-        const book = XLSX.utils.book_new(), auditSheet = XLSX.utils.json_to_sheet(rows), transactionSheet = XLSX.utils.json_to_sheet(transactions);
-        auditSheet["!cols"] = [{ wch: 28 }, { wch: 8 }, { wch: 18 }, { wch: 24 }, { wch: 60 }, { wch: 45 }];
-        transactionSheet["!cols"] = [{ wch: 12 }, { wch: 18 }, { wch: 55 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 18 }, { wch: 12 }];
-        XLSX.utils.book_append_sheet(book, auditSheet, "Page Audit");
-        XLSX.utils.book_append_sheet(book, transactionSheet, "Transactions");
-        XLSX.writeFile(book, `${active.name.replace(/\.pdf$/i, "")}-audit-and-transactions.xlsx`);
-    }
-    async function exportLastTable() {
-        if (!active)
-            return;
-        const lastPrompt = [...messages].reverse().find(message => message.role === "user")?.text ?? "all transactions";
-        const parsed = active.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
-        const matching = filterTransactions(parsed, lastPrompt);
-        if (matching.length) {
-            const XLSX = await import("xlsx"), book = XLSX.utils.book_new(), sheet = XLSX.utils.json_to_sheet(matching.map(row => ({ Date: row.date, "Transaction ID": row.transactionId, Description: row.description, Debit: row.direction === "Dr" ? row.amount : null, Credit: row.direction === "Cr" ? row.amount : null, Balance: row.balance, "Balance direction": row.balanceDirection, "Source page": row.page })));
-            sheet["!cols"] = [{ wch: 12 }, { wch: 18 }, { wch: 55 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 18 }, { wch: 12 }];
-            XLSX.utils.book_append_sheet(book, sheet, "Requested Transactions");
-            XLSX.writeFile(book, `${active.name.replace(/\.pdf$/i, "")}-requested-transactions.xlsx`);
-            return;
-        }
-        const answer = [...messages].reverse().find(message => message.role === "assistant" && /^\|.+\|/m.test(message.text));
-        if (!answer)
-            return;
-        const lines = answer.text.split("\n").filter(line => /^\|.+\|$/.test(line.trim())), rows = lines.filter((line, index) => index !== 1 && !/^\|[\s:|-]+\|$/.test(line.trim())).map(line => line.split("|").slice(1, -1).map(cell => cell.trim()));
-        if (rows.length < 2)
-            return;
-        const [headers, ...values] = rows, objects = values.map(row => Object.fromEntries(headers.map((header, index) => [header, row[index] ?? ""]))), XLSX = await import("xlsx"), book = XLSX.utils.book_new(), sheet = XLSX.utils.json_to_sheet(objects);
-        sheet["!cols"] = headers.map((header, index) => ({ wch: Math.min(45, Math.max(header.length + 2, ...values.map(row => (row[index] ?? "").length + 2))) }));
-        XLSX.utils.book_append_sheet(book, sheet, "Requested Table");
-        XLSX.writeFile(book, `${active.name.replace(/\.pdf$/i, "")}-requested-table.xlsx`);
-    }
     function approveReviewedPages() { if (!active || !active.pages.some(page => page.status === "review"))
         return; if (!window.confirm("Confirm that the CA checked every flagged page against the original PDF and verified all critical totals."))
         return; const pages = active.pages.map(page => page.status === "review" ? { ...page, approved: true } : page), next = { ...active, pages, status: "Approved" as const }; updateDocument(active.id, next); persistDocument(next); }
-    const hasChatTable = messages.some(message => message.role === "assistant" && /^\|.+\|/m.test(message.text));
+    // Head-wise and narration-wise totals are computed entirely client-side from the
+    // already-extracted, already-verified page text (the same parseTransactions() rows
+    // used for date/total answers elsewhere) — no DeepSeek call, so coverage can never
+    // depend on page-relevance filtering or batching: every read page is always included.
+    function groupedTotalsMessage(kind: "head" | "narration") {
+        if (!active || ["Processing", "Paused"].includes(active.status))
+            return;
+        const unreadable = active.pages.filter(p => p.status === "review").map(p => p.page);
+        const parsed = active.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
+        const groups = kind === "head" ? groupByHead(parsed) : groupByNarration(parsed);
+        const title = kind === "head" ? "Head / Party" : "Narration";
+        const answer = groupedTotalsAnswer(groups, title, unreadable);
+        const label = kind === "head" ? "Head-wise total" : "Narration-wise total";
+        setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: label }, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${active.name}\n\n${answer}`, exportData: { groups, title, documentName: active.name } }]);
+    }
+    function downloadCanvas(canvas: HTMLCanvasElement, filename: string) {
+        canvas.toBlob(blob => {
+            if (!blob)
+                return;
+            const url = URL.createObjectURL(blob), link = document.createElement("a");
+            link.href = url;
+            link.download = filename;
+            link.click();
+            URL.revokeObjectURL(url);
+        }, "image/png");
+    }
+    function fitText(context: CanvasRenderingContext2D, text: string, maxWidth: number) {
+        if (context.measureText(text).width <= maxWidth)
+            return text;
+        let low = 0, high = text.length;
+        while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            if (context.measureText(`${text.slice(0, mid)}…`).width <= maxWidth)
+                low = mid;
+            else
+                high = mid - 1;
+        }
+        return `${text.slice(0, low)}…`;
+    }
+    function exportGroupedImage(groups: GroupedTotal[], title: string, documentName: string) {
+        if (!groups.length)
+            return;
+        const scale = 2, width = 900 * scale, rowHeight = 46 * scale, headerHeight = 92 * scale, colHeadHeight = 42 * scale, footerHeight = 56 * scale;
+        const height = headerHeight + colHeadHeight + groups.length * rowHeight + rowHeight + footerHeight;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx)
+            return;
+        const colors = { bg: "#0b1220", headBg: "#101c30", line: "#1f2b40", text: "#e7ecf3", muted: "#8a97ab", gold: "#d5b06c", green: "#3ecf8e", red: "#f2685c", rowAlt: "#0e1728" };
+        ctx.fillStyle = colors.bg;
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = colors.text;
+        ctx.font = `700 ${26 * scale}px Georgia, serif`;
+        ctx.textBaseline = "alphabetic";
+        ctx.fillText(`${title} Report`, 26 * scale, 40 * scale);
+        ctx.fillStyle = colors.muted;
+        ctx.font = `${13 * scale}px Inter, sans-serif`;
+        ctx.fillText(`${documentName} · Harish Acharya & Co · ${new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" })}`, 26 * scale, 62 * scale);
+        ctx.strokeStyle = colors.gold;
+        ctx.lineWidth = 2 * scale;
+        ctx.beginPath();
+        ctx.moveTo(26 * scale, 74 * scale);
+        ctx.lineTo(width - 26 * scale, 74 * scale);
+        ctx.stroke();
+        const labelX = 26 * scale, labelMaxWidth = width * 0.46 - labelX - 10 * scale, debitX = width * 0.63, creditX = width * 0.81, netX = width - 26 * scale;
+        let y = headerHeight;
+        ctx.fillStyle = colors.headBg;
+        ctx.fillRect(0, y, width, colHeadHeight);
+        ctx.fillStyle = colors.muted;
+        ctx.font = `700 ${13 * scale}px Inter, sans-serif`;
+        ctx.textAlign = "left";
+        ctx.fillText(title.toUpperCase(), labelX, y + colHeadHeight / 2 + 5 * scale);
+        ctx.textAlign = "right";
+        ctx.fillText("DEBIT ₹", debitX, y + colHeadHeight / 2 + 5 * scale);
+        ctx.fillText("CREDIT ₹", creditX, y + colHeadHeight / 2 + 5 * scale);
+        ctx.fillText("NET ₹", netX, y + colHeadHeight / 2 + 5 * scale);
+        y += colHeadHeight;
+        groups.forEach((g, i) => {
+            if (i % 2 === 1) {
+                ctx.fillStyle = colors.rowAlt;
+                ctx.fillRect(0, y, width, rowHeight);
+            }
+            ctx.fillStyle = colors.text;
+            ctx.font = `${14 * scale}px Inter, sans-serif`;
+            ctx.textAlign = "left";
+            ctx.fillText(fitText(ctx, g.key, labelMaxWidth), labelX, y + rowHeight / 2 + 5 * scale);
+            ctx.textAlign = "right";
+            ctx.fillStyle = colors.muted;
+            ctx.fillText(g.debit ? formatCurrency(g.debit) : "—", debitX, y + rowHeight / 2 + 5 * scale);
+            ctx.fillText(g.credit ? formatCurrency(g.credit) : "—", creditX, y + rowHeight / 2 + 5 * scale);
+            ctx.fillStyle = g.net >= 0 ? colors.green : colors.red;
+            ctx.font = `700 ${14 * scale}px Inter, sans-serif`;
+            ctx.fillText(`${g.net >= 0 ? "+" : "-"}${formatCurrency(Math.abs(g.net))}`, netX, y + rowHeight / 2 + 5 * scale);
+            y += rowHeight;
+        });
+        const totalDebit = groups.reduce((s, g) => s + g.debit, 0), totalCredit = groups.reduce((s, g) => s + g.credit, 0), totalNet = totalCredit - totalDebit;
+        ctx.strokeStyle = colors.gold;
+        ctx.lineWidth = 1.5 * scale;
+        ctx.beginPath();
+        ctx.moveTo(labelX, y);
+        ctx.lineTo(width - labelX, y);
+        ctx.stroke();
+        ctx.font = `700 ${15 * scale}px Inter, sans-serif`;
+        ctx.textAlign = "left";
+        ctx.fillStyle = colors.text;
+        ctx.fillText("TOTAL", labelX, y + rowHeight / 2 + 5 * scale);
+        ctx.textAlign = "right";
+        ctx.fillText(formatCurrency(totalDebit), debitX, y + rowHeight / 2 + 5 * scale);
+        ctx.fillText(formatCurrency(totalCredit), creditX, y + rowHeight / 2 + 5 * scale);
+        ctx.fillStyle = totalNet >= 0 ? colors.green : colors.red;
+        ctx.fillText(`${totalNet >= 0 ? "+" : "-"}${formatCurrency(Math.abs(totalNet))}`, netX, y + rowHeight / 2 + 5 * scale);
+        y += rowHeight;
+        ctx.fillStyle = colors.muted;
+        ctx.font = `${11 * scale}px Inter, sans-serif`;
+        ctx.textAlign = "left";
+        ctx.fillText("Computed locally from every readable page. This is a review aid — verify against the source PDF.", labelX, y + 24 * scale);
+        downloadCanvas(canvas, `${documentName.replace(/\.pdf$/i, "")}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-report.png`);
+    }
+    function exportGroupedChart(groups: GroupedTotal[], title: string, documentName: string) {
+        if (!groups.length)
+            return;
+        const shown = groups.slice(0, 12), truncated = groups.length > shown.length;
+        const scale = 2, width = 1000 * scale, rowHeight = 50 * scale, headerHeight = 92 * scale, footerHeight = truncated ? 70 * scale : 50 * scale;
+        const height = headerHeight + shown.length * rowHeight + footerHeight;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx)
+            return;
+        const colors = { bg: "#0b1220", text: "#e7ecf3", muted: "#8a97ab", gold: "#d5b06c", green: "#3ecf8e", red: "#f2685c", zero: "#33415a" };
+        ctx.fillStyle = colors.bg;
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = colors.text;
+        ctx.font = `700 ${26 * scale}px Georgia, serif`;
+        ctx.textAlign = "left";
+        ctx.fillText(`${title} — Net by ${title.split(" ")[0]}`, 26 * scale, 40 * scale);
+        ctx.fillStyle = colors.muted;
+        ctx.font = `${13 * scale}px Inter, sans-serif`;
+        ctx.fillText(`${documentName} · Harish Acharya & Co · ${new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" })}`, 26 * scale, 62 * scale);
+        ctx.strokeStyle = colors.gold;
+        ctx.lineWidth = 2 * scale;
+        ctx.beginPath();
+        ctx.moveTo(26 * scale, 74 * scale);
+        ctx.lineTo(width - 26 * scale, 74 * scale);
+        ctx.stroke();
+        const labelColW = 250 * scale, valueColW = 160 * scale, barAreaX0 = 26 * scale + labelColW, barAreaX1 = width - 26 * scale - valueColW, barCenter = barAreaX0 + (barAreaX1 - barAreaX0) * 0.5, barHalfWidth = Math.min(barCenter - barAreaX0, barAreaX1 - barCenter);
+        const maxAbs = Math.max(...shown.map(g => Math.abs(g.net)), 1);
+        ctx.strokeStyle = colors.zero;
+        ctx.lineWidth = 1 * scale;
+        ctx.beginPath();
+        ctx.moveTo(barCenter, headerHeight);
+        ctx.lineTo(barCenter, headerHeight + shown.length * rowHeight);
+        ctx.stroke();
+        let y = headerHeight;
+        shown.forEach(g => {
+            const barLen = (Math.abs(g.net) / maxAbs) * (barHalfWidth - 8 * scale), positive = g.net >= 0, barY = y + rowHeight * 0.32, barH = rowHeight * 0.36;
+            ctx.fillStyle = colors.text;
+            ctx.font = `${13 * scale}px Inter, sans-serif`;
+            ctx.textAlign = "left";
+            ctx.fillText(fitText(ctx, g.key, labelColW - 14 * scale), 26 * scale, y + rowHeight / 2 + 5 * scale);
+            ctx.fillStyle = positive ? colors.green : colors.red;
+            ctx.fillRect(positive ? barCenter : barCenter - barLen, barY, barLen, barH);
+            ctx.font = `700 ${13 * scale}px Inter, sans-serif`;
+            ctx.textAlign = "right";
+            ctx.fillText(`${positive ? "+" : "-"}${formatCurrency(Math.abs(g.net))}`, width - 26 * scale, y + rowHeight / 2 + 5 * scale);
+            y += rowHeight;
+        });
+        ctx.fillStyle = colors.muted;
+        ctx.font = `${11 * scale}px Inter, sans-serif`;
+        ctx.textAlign = "left";
+        let footY = y + 24 * scale;
+        if (truncated) {
+            ctx.fillText(`Showing the ${shown.length} largest of ${groups.length} rows by size — export the table view above for every row.`, 26 * scale, footY);
+            footY += 18 * scale;
+        }
+        ctx.fillText("Computed locally from every readable page. This is a review aid — verify against the source PDF.", 26 * scale, footY);
+        downloadCanvas(canvas, `${documentName.replace(/\.pdf$/i, "")}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-chart.png`);
+    }
     const progress = active?.totalPages ? Math.round(active.processedPages / active.totalPages * 100) : 0;
     if (showSplash)
-        return <main className="splash"><div className="splashGlow"/><div className="splashSeal">AH</div><p>A HARISH CO</p><h1>Clarity for every page.</h1><span>Preparing your private document workspace</span><div className="loadingTrack"><i /></div><small>Documents deserve care. Numbers deserve certainty.</small></main>;
+        return <main className="splash"><div className="splashGlow"/><div className="splashSeal">HA</div><p>HARISH ACHARYA & CO</p><h1>Clarity for every page.</h1><span>Preparing your private document workspace</span><div className="loadingTrack"><i /></div><small>Documents deserve care. Numbers deserve certainty.</small></main>;
     return <main className="shell" ref={topRef}>
-    <div className="scanControls"><div><strong>Reading mode</strong><span>Fast uses heavy OCR only for doubtful pages.</span></div><button className={scanMode === "fast" ? "active" : ""} onClick={() => setScanMode("fast")}>Fast scan</button><button className={scanMode === "maximum" ? "active" : ""} onClick={() => setScanMode("maximum")}>Maximum verification</button>{active?.status === "Processing" && <button onClick={() => setControl(active.id, "paused")}>Pause</button>}{active?.status === "Paused" && <button onClick={() => setControl(active.id, "running")}>Resume</button>}{active && ["Processing", "Paused"].includes(active.status) && <button className="danger" onClick={() => setControl(active.id, "cancelled")}>Cancel</button>}{active && ["Processing", "Paused"].includes(active.status) && <small>Remaining: {formatEta(active.etaSeconds)}</small>}{analysisProgress && <small>{analysisProgress}</small>}{hasChatTable && <button onClick={exportLastTable}>Table to Excel</button>}{active?.status === "Review" && <button onClick={approveReviewedPages}>CA approve reviewed pages</button>}{active && <button className="danger" onClick={() => deleteDocument(active.id)}>Delete PDF</button>}</div>
     {batchNotice && <div className="batchNotice" role="status">{batchNotice}<button onClick={() => setBatchNotice("")} aria-label="Dismiss notification">Close</button></div>}
-    <aside className="sidebar"><div className="brand"><span className="brandMark">AH</span><div><strong>A Harish Co</strong><small>Chartered Accountants</small></div></div><nav aria-label="Workspace navigation"><button className="navItem active" onClick={() => scrollTo(topRef)}><span>⌂</span> Workspace</button><button className="navItem" onClick={() => scrollTo(documentsRef)}><span>▤</span> Documents <em>{documents.length}</em></button><button className="navItem" onClick={() => scrollTo(reviewRef)}><span>✓</span> Review queue <em>{totals.review}</em></button><button className="navItem" onClick={() => scrollTo(exportRef)}><span>⇩</span> Exports</button></nav><div className="sidebarMessage"><span>“</span><p>Good accounting begins with evidence you can trace.</p></div><div className="sidebarFoot"><div className="secure"><span>◆</span><div><strong>Local-first reading</strong><small>PDF reading stays in this browser</small></div></div><div className="profile"><span>AH</span><div><strong>A Harish Co</strong><small>Private workspace</small></div></div></div></aside>
-    <section className="content"><header className="topbar"><div><p className="eyebrow">A HARISH CO · DOCUMENT INTELLIGENCE</p><h1>Every page, treated with care.</h1><p>Upload, review, ask questions and export a traceable page audit from one calm workspace.</p></div><button className="primary" onClick={() => inputRef.current?.click()}>＋ Add PDF</button><input ref={inputRef} type="file" accept="application/pdf" multiple hidden onChange={e => e.target.files && processFiles(e.target.files)}/></header>
-      <div className="welcomeBanner"><div className="welcomeIcon">AH</div><div><strong>Welcome to your private document desk.</strong><p>Nothing unclear is silently accepted. Review flags remain visible before any professional decision.</p></div><span>Private workspace</span></div>
+    <aside className="sidebar"><div className="brand"><span className="brandMark">HA</span><div><strong>Harish Acharya &amp; Co</strong><small>Chartered Accountants</small></div></div><nav aria-label="Workspace navigation"><button className="navItem active" onClick={() => scrollTo(topRef)}><span>⌂</span> Workspace</button><button className="navItem" onClick={() => scrollTo(documentsRef)}><span>▤</span> Documents <em>{documents.length}</em></button><button className="navItem" onClick={() => scrollTo(reviewRef)}><span>✓</span> Review queue <em>{totals.review}</em></button></nav><div className="sidebarMessage"><span>“</span><p>Good accounting begins with evidence you can trace.</p></div><div className="sidebarFoot"><div className="secure"><span>◆</span><div><strong>Local-first reading</strong><small>PDF reading stays in this browser</small></div></div><div className="profile"><span>HA</span><div><strong>Harish Acharya &amp; Co</strong><small>Private workspace</small></div></div></div></aside>
+    <section className="content">
+    <div className="scanControls"><div><strong>Reading mode</strong><span>Fast uses heavy OCR only for doubtful pages.</span></div><button className={scanMode === "fast" ? "active" : ""} onClick={() => setScanMode("fast")}>Fast scan</button><button className={scanMode === "maximum" ? "active" : ""} onClick={() => setScanMode("maximum")}>Maximum verification</button>{active?.status === "Processing" && <button onClick={() => setControl(active.id, "paused")}>Pause</button>}{active?.status === "Paused" && <button onClick={() => setControl(active.id, "running")}>Resume</button>}{active && ["Processing", "Paused"].includes(active.status) && <button className="danger" onClick={() => setControl(active.id, "cancelled")}>Cancel</button>}{active && ["Processing", "Paused"].includes(active.status) && <small>Remaining: {formatEta(active.etaSeconds)}</small>}{analysisProgress && <small>{analysisProgress}</small>}{active?.status === "Review" && <button onClick={approveReviewedPages}>CA approve reviewed pages</button>}{active && <button className="danger" onClick={() => deleteDocument(active.id)}>Delete PDF</button>}</div>
+    <header className="topbar"><div><p className="eyebrow">HARISH ACHARYA &amp; CO · DOCUMENT INTELLIGENCE</p></div><button className="primary" onClick={() => inputRef.current?.click()}>＋ Add PDF</button><input ref={inputRef} type="file" accept="application/pdf" multiple hidden onChange={e => e.target.files && processFiles(e.target.files)}/></header>
       <section className="metrics"><article><span>PDF pages</span><strong>{totals.pages}</strong><small>Received</small></article><article><span>Pages processed</span><strong>{totals.processed}</strong><small className="good">Tracked one by one</small></article><article><span>Needs review</span><strong>{totals.review}</strong><small className={totals.review ? "warn" : "good"}>{totals.review ? "Never guessed" : "Nothing flagged"}</small></article><article><span>Active progress</span><strong>{progress}%</strong><small>{active?.status ?? "Waiting for PDF"}</small></article></section>
-      <section className="workspaceGrid"><div className="mainColumn"><div className={`dropzone ${isDragging ? "dragging" : ""}`} role="button" tabIndex={0} onKeyDown={e => { if (e.key === "Enter" || e.key === " ")
-        inputRef.current?.click(); }} onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={e => { e.preventDefault(); setIsDragging(false); processFiles(e.dataTransfer.files); }} onClick={() => inputRef.current?.click()}><span className="uploadIcon">↑</span><div><strong>Bring a PDF into the workspace</strong><p>Digital or scanned · every processed page counted · OCR used when needed</p></div><button type="button">Browse files</button></div>
+      <section className="workspaceGrid"><div className="mainColumn">
         <section className="panel anchorSection" ref={documentsRef}><div className="panelHead"><div><span className="sectionTag">DOCUMENT DESK</span><h2>Documents</h2><p>Each upload receives a permanent PDF number. Select one, use its filename, or ask about “PDF 1”.</p></div><button className="miniAction" onClick={() => inputRef.current?.click()}>Add another</button></div><div>{documents.length === 0 && <button className="emptyState" onClick={() => inputRef.current?.click()}><strong>No documents yet</strong><span>Choose a PDF to begin real page processing.</span></button>}{documents.map(doc => { const pct = doc.totalPages ? Math.round(doc.processedPages / doc.totalPages * 100) : 0; return <button key={doc.id} className={`documentRow ${active?.id === doc.id ? "selected" : ""}`} onClick={() => { setActiveId(doc.id); setMessages([welcome]); }}><span className="pdfIcon">{doc.uploadNumber}</span><span className="docInfo"><strong>PDF {doc.uploadNumber} · {doc.name}</strong><small>{doc.processedPages} of {doc.totalPages || "?"} pages · {doc.size}</small></span><span className="progressWrap"><span><i style={{ width: `${pct}%` }}/></span><small>{pct}%</small></span><span className={`status ${doc.status === "Ready" ? "verified" : doc.status === "Review" ? "review" : "processing"}`}>{doc.status}</span><span className="chevron">›</span></button>; })}</div></section>
-        <section className="panel chatPanel"><div className="chatHead"><div><span className="botAvatar">A</span><div><span className="sectionTag">DOCUMENT ASSISTANT</span><h2>Ask A Harish Assistant</h2></div></div><span className="online"><i /> {active ? active.status : "Waiting"}</span></div><div className="chatMessages">{messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "assistant" ? "AH" : "You"}</span>{m.role === "assistant" ? <AssistantContent text={m.text}/> : <p>{m.text}</p>}</div>)}{asking && <div className="message assistant"><span>AH</span><p className="typing"><i /><i /><i /></p></div>}<div ref={chatEndRef}/></div>{active?.pages.some(p => p.status === "review") && <div className="warningBanner"><strong>{active.pages.filter(p => p.status === "review").length} pages need review:</strong> {active.pages.filter(p => p.status === "review").map(p => p.page).join(", ")}. These pages are excluded from answers until the CA checks them.</div>}<div className="suggestions"><button onClick={() => askQuestion("Summarise this document with page references")}>Summarise with sources</button><button onClick={() => askQuestion("Create one clean table of the important entries, with a source page in every row")}>Create a table</button><button onClick={() => askQuestion("Identify possible inconsistencies without guessing")}>Find inconsistencies</button></div><div className="questionBox"><textarea aria-label="Ask a question about the PDF" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleQuestionKey} placeholder={active ? "Ask anything about this PDF…" : "Upload and select a PDF first…"}/><button disabled={!active || asking || ["Processing", "Paused"].includes(active.status) || !question.trim()} onClick={() => askQuestion()} aria-label="Send question">Send</button></div><p className="chatNote">Answers use extracted evidence. Verify flagged pages and important totals before approval.</p></section>
+        <section className="panel chatPanel"><div className="chatHead"><div><span className="botAvatar">HA</span><div><span className="sectionTag">DOCUMENT ASSISTANT</span><h2>Ask Harish Acharya Assistant</h2></div></div><span className="online"><i /> {active ? active.status : "Waiting"}</span></div><div className="chatMessages">{messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "assistant" ? "HA" : "You"}</span><div>{m.role === "assistant" ? <AssistantContent text={m.text}/> : <p>{m.text}</p>}{m.exportData && <div className="exportRow"><button onClick={() => exportGroupedImage(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as image</button><button onClick={() => exportGroupedChart(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as chart</button></div>}</div></div>)}{asking && <div className="message assistant"><span>HA</span><p className="typing"><i /><i /><i /></p></div>}<div ref={chatEndRef}/></div>{active?.pages.some(p => p.status === "review") && <div className="warningBanner"><strong>{active.pages.filter(p => p.status === "review").length} pages need review:</strong> {active.pages.filter(p => p.status === "review").map(p => p.page).join(", ")}. These pages are excluded from answers until the CA checks them.</div>}<div className="suggestions"><button onClick={() => askQuestion("Summarise this document with page references")}>Summarise with sources</button><button onClick={() => askQuestion("Create one clean table of the important entries, with a source page in every row")}>Create a table</button><button onClick={() => askQuestion("Identify possible inconsistencies without guessing")}>Find inconsistencies</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("head")}>Head-wise total</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("narration")}>Narration-wise total</button></div><div className="questionBox"><textarea aria-label="Ask a question about the PDF" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleQuestionKey} placeholder={active ? "Ask anything about this PDF…" : "Upload and select a PDF first…"}/><button disabled={!active || asking || ["Processing", "Paused"].includes(active.status) || !question.trim()} onClick={() => askQuestion()} aria-label="Send question">Send</button></div><p className="chatNote">Answers use extracted evidence. Verify flagged pages and important totals before approval.</p></section>
       </div><aside className="rightColumn"><section className="panel"><div className="panelHead"><div><span className="sectionTag">CONTROLLED WORKFLOW</span><h2>Five careful stages</h2></div></div><div className="specialists">{specialists.map(([n, name, desc]) => <div className="specialist" key={n}><span>{n}</span><div><strong>{name}</strong><p>{desc}</p><small>✓ Evidence preserved</small></div></div>)}</div></section>
         <section className="panel anchorSection" ref={reviewRef}><div className="panelHead"><div><span className="sectionTag amber">REVIEW QUEUE</span><h2>{active ? `${active.pages.filter(p => p.status === "review").length} pages flagged` : "No document selected"}</h2><p>Uncertain values are never guessed or silently accepted.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to create a review queue</button>}{active?.pages.filter(p => p.status === "review").slice(0, 8).map(p => <div className="reviewItem" key={p.page}><span>PAGE {p.page}</span><strong>CA review required</strong><p>Open this page in the original PDF and verify its important values. It remains excluded from answers.</p></div>)}{active?.status === "Review" && <div className="reviewHelp"><strong>Want another automatic attempt?</strong><p>Select Maximum Verification above and upload the same PDF again. The CA must still check any page that remains flagged.</p></div>}{active && active.pages.every(p => p.status === "read") && active.status !== "Processing" && <div className="reviewItem complete"><span>COMPLETE</span><strong>All pages produced readable text</strong><p>Important values still need professional approval.</p></div>}</section>
-        <section className={`exportCard anchorSection ${!active || active.status === "Processing" ? "disabled" : ""}`} ref={exportRef} role="button" tabIndex={active && active.status !== "Processing" ? 0 : -1} onClick={exportExcel} onKeyDown={e => { if (e.key === "Enter")
-        exportExcel(); }}><div><span>EXCEL EXPORT STUDIO</span><h2>Page audit workbook</h2><p>Document, page, reading method, extracted text and every review message.</p></div><button disabled={!active || active.status === "Processing"} onClick={e => { e.stopPropagation(); exportExcel(); }}>{active ? "Download .xlsx" : "Select a PDF first"}</button></section>
       </aside></section>
     </section>
   </main>;
