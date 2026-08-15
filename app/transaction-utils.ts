@@ -11,8 +11,47 @@ export type ParsedTransaction = {
 
 const rowPattern = /(\d{2}[-/.]\d{2}[-/.]\d{4})\s+(\S+)\s+(.+?)\s+(\d[\d,]*\.\d{2})\s*\(?(Dr|Cr)\)?\s+(\d[\d,]*\.\d{2})\s*\(?(Dr|Cr)\)?(?=\s+\d{2}[-/.]\d{2}[-/.]\d{4}|\s*$)/gi;
 
+// Fallback for the very common bank-statement layout where Debit and Credit are two
+// separate columns (a value in one, a dash/blank in the other) with no Dr/Cr label on
+// the amount itself - only the running balance carries that label. Tried only when the
+// primary pattern above finds nothing, so it never changes behavior for text that
+// already parses correctly.
+const splitColumnPattern = /(\d{2}[-/.]\d{2}[-/.]\d{2,4})\s+(.+?)\s+(\d[\d,]*\.\d{2}|[-–—]+)\s+(\d[\d,]*\.\d{2}|[-–—]+)\s+(\d[\d,]*\.\d{2})\s*\(?(Dr|Cr)\)?(?=\s+\d{2}[-/.]\d{2}[-/.]\d{2,4}|\s*$)/gi;
+
 function amount(value: string) {
   return Number(value.replace(/,/g, ""));
+}
+
+function isBlankCell(value: string) {
+  return /^[-–—]+$/.test(value.trim());
+}
+
+function referenceToken(description: string) {
+  return description.match(/\S+/)?.[0] ?? "";
+}
+
+function parseTransactionsSplitColumns(text: string, page: number): ParsedTransaction[] {
+  const rows: ParsedTransaction[] = [];
+  const normalized = text.replace(/\s+/g, " ").trim();
+  for (const match of normalized.matchAll(splitColumnPattern)) {
+    const debitBlank = isBlankCell(match[3]), creditBlank = isBlankCell(match[4]);
+    if (debitBlank === creditBlank) continue; // both filled or both blank: can't tell direction, skip rather than guess
+    const parsedAmount = amount(debitBlank ? match[4] : match[3]);
+    const parsedBalance = amount(match[5]);
+    if (!Number.isFinite(parsedAmount) || !Number.isFinite(parsedBalance)) continue;
+    const description = match[2].trim();
+    rows.push({
+      page,
+      date: match[1].replace(/[/.]/g, "-"),
+      transactionId: referenceToken(description),
+      description,
+      amount: parsedAmount,
+      direction: debitBlank ? "Cr" : "Dr",
+      balance: parsedBalance,
+      balanceDirection: match[6].toLowerCase() === "dr" ? "Dr" : "Cr",
+    });
+  }
+  return rows;
 }
 
 export function parseTransactions(text: string, page: number): ParsedTransaction[] {
@@ -33,7 +72,7 @@ export function parseTransactions(text: string, page: number): ParsedTransaction
       balanceDirection: match[7].toLowerCase() === "dr" ? "Dr" : "Cr",
     });
   }
-  return rows;
+  return rows.length ? rows : parseTransactionsSplitColumns(text, page);
 }
 
 export function parseTransactionTable(text: string): ParsedTransaction[] {
