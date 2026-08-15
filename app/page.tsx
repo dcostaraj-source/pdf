@@ -24,6 +24,7 @@ type PaddleEngine = {
     }>>;
     dispose: () => Promise<void>;
 };
+type PdfDocumentProxy = Awaited<ReturnType<(typeof import("pdfjs-dist"))["getDocument"]>["promise"]>;
 type ScanMode = "fast" | "maximum";
 type DocumentResult = {
     id: string;
@@ -87,7 +88,63 @@ export default function Home() {
     const inputRef = useRef<HTMLInputElement>(null), topRef = useRef<HTMLElement>(null), documentsRef = useRef<HTMLElement>(null), reviewRef = useRef<HTMLElement>(null), pageAuditRef = useRef<HTMLElement>(null), chatEndRef = useRef<HTMLDivElement>(null);
     const [expandedPages, setExpandedPages] = useState<Set<number>>(new Set());
     function togglePageText(page: number) { setExpandedPages(current => { const next = new Set(current); if (next.has(page)) next.delete(page); else next.add(page); return next; }); }
+    // Green/yellow/red at a glance so the CA's eye goes straight to the handful of
+    // pages that actually need a look, not all of them. Reuses the confidence/agreement
+    // percentage already recorded in verification text - no new OCR data needed.
+    function pageConfidenceClass(p: PageResult) {
+        if (p.status === "review")
+            return "confRed";
+        if (p.method === "embedded text")
+            return "confGreen";
+        const pct = Number(p.verification?.match(/(\d+)%/)?.[1]);
+        if (!Number.isFinite(pct))
+            return "confGreen";
+        if (pct >= 90)
+            return "confGreen";
+        if (pct >= 70)
+            return "confYellow";
+        return "confRed";
+    }
     const controlRef = useRef<Record<string, "running" | "paused" | "cancelled">>({}), uploadCounterRef = useRef(0);
+    // Kept in memory only (never persisted/serialized to localStorage - a full PDF's
+    // bytes would blow past its quota) so the original page can be re-rendered on
+    // demand for the Page Audit viewer. Gracefully unavailable after a browser reload
+    // until the file is re-selected; the extracted text is unaffected either way.
+    const fileCache = useRef<Map<string, File>>(new Map());
+    const pdfDocCache = useRef<Map<string, Promise<PdfDocumentProxy>>>(new Map());
+    const [pageImages, setPageImages] = useState<Record<string, string>>({});
+    const [loadingPageImages, setLoadingPageImages] = useState<Set<string>>(new Set());
+    async function loadPageImage(documentId: string, page: number) {
+        const key = `${documentId}-${page}`;
+        if (pageImages[key] || loadingPageImages.has(key))
+            return;
+        const file = fileCache.current.get(documentId);
+        if (!file)
+            return;
+        setLoadingPageImages(current => new Set(current).add(key));
+        try {
+            if (!pdfDocCache.current.has(documentId))
+                pdfDocCache.current.set(documentId, (async () => {
+                    const pdfjs = await import("pdfjs-dist");
+                    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+                    return pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+                })());
+            const pdf = await pdfDocCache.current.get(documentId)!;
+            const pdfPage = await pdf.getPage(page), viewport = pdfPage.getViewport({ scale: 1.3 }), canvas = document.createElement("canvas");
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
+            const context = canvas.getContext("2d");
+            if (context) {
+                await pdfPage.render({ canvas, canvasContext: context, viewport }).promise;
+                setPageImages(current => ({ ...current, [key]: canvas.toDataURL("image/png") }));
+            }
+            pdfPage.cleanup();
+        }
+        catch { /* The extracted text still shows even if the original page can't be re-rendered. */ }
+        finally {
+            setLoadingPageImages(current => { const next = new Set(current); next.delete(key); return next; });
+        }
+    }
     const active = documents.find(doc => doc.id === activeId) ?? documents[0];
     useEffect(() => { const timer = window.setTimeout(() => setShowSplash(false), 5000); return () => window.clearTimeout(timer); }, []);
     useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [messages, asking]);
@@ -111,7 +168,9 @@ export default function Home() {
         return; controlRef.current[id] = "cancelled"; try {
         localStorage.removeItem(`ah-progress:${target.name}:${target.size}`);
     }
-    catch { /* Deletion still succeeds when browser storage is unavailable. */ } setDocuments(current => { const remaining = current.filter(document => document.id !== id); if (activeId === id)
+    catch { /* Deletion still succeeds when browser storage is unavailable. */ } fileCache.current.delete(id); pdfDocCache.current.delete(id); setPageImages(current => { const next = { ...current }; for (const key of Object.keys(next))
+        if (key.startsWith(`${id}-`))
+            delete next[key]; return next; }); setDocuments(current => { const remaining = current.filter(document => document.id !== id); if (activeId === id)
         setActiveId(remaining[0]?.id ?? null); return remaining; }); setMessages([welcome]); setBatchNotice(`${target.name} was deleted.`); }
     async function waitWhilePaused(id: string) { while (controlRef.current[id] === "paused")
         await new Promise(resolve => window.setTimeout(resolve, 250)); return controlRef.current[id] !== "cancelled"; }
@@ -166,6 +225,7 @@ export default function Home() {
         const resumable = saved && saved.processedPages < saved.totalPages && saved.status !== "Cancelled" ? saved : undefined, uploadNumber = resumable?.uploadNumber ?? ++uploadCounterRef.current;
         uploadCounterRef.current = Math.max(uploadCounterRef.current, uploadNumber);
         const initial: DocumentResult = { id, name: file.name, size, pages: resumable?.pages ?? [], totalPages: resumable?.totalPages ?? 0, processedPages: resumable?.processedPages ?? 0, status: "Processing", startedAt: Date.now(), mode: resumable?.mode ?? scanMode, uploadNumber };
+        fileCache.current.set(id, file);
         controlRef.current[id] = "running";
         setDocuments(current => [initial, ...current]);
         setActiveId(id);
@@ -644,7 +704,7 @@ export default function Home() {
       <section className="workspaceGrid"><div className="mainColumn">
         <section className="panel anchorSection" ref={documentsRef}><div className="panelHead"><div><span className="sectionTag">DOCUMENT DESK</span><h2>Documents</h2><p>Each upload receives a permanent PDF number. Select one, use its filename, or ask about “PDF 1”.</p></div><button className="miniAction" onClick={() => inputRef.current?.click()}>Add another</button></div><div>{documents.length === 0 && <button className="emptyState" onClick={() => inputRef.current?.click()}><strong>No documents yet</strong><span>Choose a PDF to begin real page processing.</span></button>}{documents.map(doc => { const pct = doc.totalPages ? Math.round(doc.processedPages / doc.totalPages * 100) : 0; return <button key={doc.id} className={`documentRow ${active?.id === doc.id ? "selected" : ""}`} onClick={() => { setActiveId(doc.id); setMessages([welcome]); }}><span className="pdfIcon">{doc.uploadNumber}</span><span className="docInfo"><strong>PDF {doc.uploadNumber} · {doc.name}</strong><small>{doc.processedPages} of {doc.totalPages || "?"} pages · {doc.size}</small></span><span className="progressWrap"><span><i style={{ width: `${pct}%` }}/></span><small>{pct}%</small></span><span className={`status ${doc.status === "Ready" ? "verified" : doc.status === "Review" ? "review" : "processing"}`}>{doc.status}</span><span className="chevron">›</span></button>; })}</div></section>
         <section className="panel chatPanel"><div className="chatHead"><div><span className="botAvatar">HA</span><div><span className="sectionTag">DOCUMENT ASSISTANT</span><h2>Ask Harish Acharya Assistant</h2></div></div><span className="online"><i /> {active ? active.status : "Waiting"}</span></div><div className="chatMessages">{messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "assistant" ? "HA" : "You"}</span><div>{m.role === "assistant" ? <AssistantContent text={m.text}/> : <p>{m.text}</p>}{m.exportData && <div className="exportRow"><button onClick={() => exportGroupedImage(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as image</button><button onClick={() => exportGroupedChart(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as chart</button></div>}</div></div>)}{asking && <div className="message assistant"><span>HA</span><p className="typing"><i /><i /><i /></p></div>}<div ref={chatEndRef}/></div>{active?.pages.some(p => p.status === "review") && <div className="warningBanner"><strong>{active.pages.filter(p => p.status === "review").length} pages need review:</strong> {active.pages.filter(p => p.status === "review").map(p => p.page).join(", ")}. These pages are excluded from answers until the CA checks them.</div>}<div className="suggestions"><button onClick={() => askQuestion("Summarise this document with page references")}>Summarise with sources</button><button onClick={() => askQuestion("Create one clean table of the important entries, with a source page in every row")}>Create a table</button><button onClick={() => askQuestion("Identify possible inconsistencies without guessing")}>Find inconsistencies</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("head")}>Head-wise total</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("narration")}>Narration-wise total</button></div><div className="questionBox"><textarea aria-label="Ask a question about the PDF" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleQuestionKey} placeholder={active ? "Ask anything about this PDF…" : "Upload and select a PDF first…"}/><button disabled={!active || asking || ["Processing", "Paused"].includes(active.status) || !question.trim()} onClick={() => askQuestion()} aria-label="Send question">Send</button></div><p className="chatNote">Answers use extracted evidence. Verify flagged pages and important totals before approval.</p></section>
-        <section className="panel anchorSection" ref={pageAuditRef}><div className="panelHead"><div><span className="sectionTag">PAGE AUDIT</span><h2>Every page, laid out to check</h2><p>Page number, how it was read, and the exact text pulled from it. Open any page and compare it against the original PDF yourself.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to see its page audit here</button>}{active && <div className="pageAudit">{active.pages.map(p => <div key={p.page}><button className="pageAuditRow" onClick={() => togglePageText(p.page)}><span>PAGE {p.page}</span><span>{p.method}</span><span className={`status ${p.status === "read" ? "verified" : "review"}`}>{p.status === "read" ? "Read" : "Review"}</span><span className="pageAuditNote">{p.verification ?? p.message ?? ""}</span><span className="chevron">{expandedPages.has(p.page) ? "︿" : "﹀"}</span></button>{expandedPages.has(p.page) && <div className="pageAuditText">{p.text.trim() || "No text was extracted from this page."}</div>}</div>)}{active.pages.length < active.totalPages && <p className="pageAuditNote" style={{ padding: "12px 20px", margin: 0 }}>Still reading — {active.totalPages - active.pages.length} page{active.totalPages - active.pages.length === 1 ? "" : "s"} remaining.</p>}</div>}</section>
+        <section className="panel anchorSection" ref={pageAuditRef}><div className="panelHead"><div><span className="sectionTag">PAGE AUDIT</span><h2>Every page, laid out to check</h2><p>Page number, how it was read, and the exact text pulled from it. Open any page and compare it against the original PDF yourself.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to see its page audit here</button>}{active && <><p className="pageAuditHeader">Total pages detected: <strong>{active.totalPages || "…"}</strong> · Pages processed: <strong>{active.pages.length}</strong> · Status: <strong>{active.totalPages ? Math.round(active.pages.length / active.totalPages * 100) : 0}% verified</strong></p><div className="pageAudit">{active.pages.map(p => <div key={p.page}><button className="pageAuditRow" onClick={() => { const opening = !expandedPages.has(p.page); togglePageText(p.page); if (opening) loadPageImage(active.id, p.page); }}><span><i className={`confDot ${pageConfidenceClass(p)}`}/>PAGE {p.page}</span><span>{p.method}</span><span className={`status ${p.status === "read" ? "verified" : "review"}`}>{p.status === "read" ? "Read" : "Review"}</span><span className="pageAuditNote">{p.verification ?? p.message ?? ""}</span><span className="chevron">{expandedPages.has(p.page) ? "︿" : "﹀"}</span></button>{expandedPages.has(p.page) && <div className="pageAuditText">{pageImages[`${active.id}-${p.page}`] ? <img className="pageAuditImage" src={pageImages[`${active.id}-${p.page}`]} alt={`Original scan of page ${p.page}`}/> : loadingPageImages.has(`${active.id}-${p.page}`) ? <p className="pageAuditImageLoading">Loading the original page image…</p> : null}{p.text.trim() || "No text was extracted from this page."}</div>}</div>)}{active.pages.length < active.totalPages && <p className="pageAuditNote" style={{ padding: "12px 20px", margin: 0 }}>Still reading — {active.totalPages - active.pages.length} page{active.totalPages - active.pages.length === 1 ? "" : "s"} remaining.</p>}</div></>}</section>
       </div><aside className="rightColumn"><section className="panel"><div className="panelHead"><div><span className="sectionTag">CONTROLLED WORKFLOW</span><h2>Five careful stages</h2></div></div><div className="specialists">{specialists.map(([n, name, desc]) => <div className="specialist" key={n}><span>{n}</span><div><strong>{name}</strong><p>{desc}</p><small>✓ Evidence preserved</small></div></div>)}</div></section>
         <section className="panel anchorSection" ref={reviewRef}><div className="panelHead"><div><span className="sectionTag amber">REVIEW QUEUE</span><h2>{active ? `${active.pages.filter(p => p.status === "review").length} pages flagged` : "No document selected"}</h2><p>Uncertain values are never guessed or silently accepted.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to create a review queue</button>}{active?.pages.filter(p => p.status === "review").slice(0, 8).map(p => <div className="reviewItem" key={p.page}><span>PAGE {p.page}</span><strong>CA review required</strong><p>Open this page in the original PDF and verify its important values. It remains excluded from answers.</p></div>)}{active?.status === "Review" && <div className="reviewHelp"><strong>Want another automatic attempt?</strong><p>Select Maximum Verification above and upload the same PDF again. The CA must still check any page that remains flagged.</p></div>}{active && active.pages.every(p => p.status === "read") && active.status !== "Processing" && <div className="reviewItem complete"><span>COMPLETE</span><strong>All pages produced readable text</strong><p>Important values still need professional approval.</p></div>}</section>
       </aside></section>
