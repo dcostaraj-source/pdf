@@ -132,36 +132,26 @@ export default function Home() {
     function financialSanity(text: string) { const markers = text.match(/\b\d[\d,]*\.\d{2}\s*\(?(?:CR|DR)\)?\b/gi) ?? []; const impossible = markers.some(value => !Number.isFinite(Number(value.replace(/\(?(?:cr|dr)\)?/ig, "").replace(/,/g, "").trim()))); return { checked: markers.length, passed: !impossible }; }
     async function renderOcrCanvas(page: Awaited<ReturnType<Awaited<ReturnType<(typeof import("pdfjs-dist"))["getDocument"]>["promise"]>["getPage"]>>, scale: number, enhance: boolean) { const viewport = page.getViewport({ scale }), canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height); const context = canvas.getContext("2d", { willReadFrequently: true }); if (!context)
         throw new Error("Canvas unavailable"); await page.render({ canvas, canvasContext: context, viewport }).promise; if (enhance) {
-        const width = canvas.width, height = canvas.height;
-        const image = context.getImageData(0, 0, width, height), data = image.data;
+        const image = context.getImageData(0, 0, canvas.width, canvas.height), data = image.data;
         for (let i = 0; i < data.length; i += 4) {
             const gray = .299 * data[i] + .587 * data[i + 1] + .114 * data[i + 2], value = Math.max(0, Math.min(255, (gray - 128) * 1.45 + 128));
             data[i] = value;
             data[i + 1] = value;
             data[i + 2] = value;
         }
-        // Mild unsharp-style sharpen on top of the contrast stretch to recover faint
-        // or slightly blurred strokes before the retry OCR pass. This only ever runs
-        // on the fallback path, so it can only help a page that already failed once.
-        if (width > 2 && height > 2) {
-            const gray = new Uint8ClampedArray(width * height);
-            for (let p = 0; p < gray.length; p++) gray[p] = data[p * 4];
-            const kernel = [0, -0.5, 0, -0.5, 3, -0.5, 0, -0.5, 0];
-            for (let y = 1; y < height - 1; y++) {
-                for (let x = 1; x < width - 1; x++) {
-                    let sum = 0, k = 0;
-                    for (let ky = -1; ky <= 1; ky++)
-                        for (let kx = -1; kx <= 1; kx++)
-                            sum += gray[(y + ky) * width + (x + kx)] * kernel[k++];
-                    const idx = (y * width + x) * 4, value = Math.max(0, Math.min(255, sum));
-                    data[idx] = value;
-                    data[idx + 1] = value;
-                    data[idx + 2] = value;
-                }
-            }
-        }
         context.putImageData(image, 0, 0);
     } return canvas; }
+    // A stuck OCR call (a pathological image, a CDN hiccup for PaddleOCR, a dead
+    // worker) must never block the whole document forever. Any page whose work
+    // doesn't finish within this window is treated the same as a normal OCR
+    // failure: sent to CA review, never silently skipped.
+    const PAGE_TIMEOUT_MS = 45_000;
+    function withPageTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+        return new Promise((resolve, reject) => {
+            const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), PAGE_TIMEOUT_MS);
+            promise.then(value => { window.clearTimeout(timer); resolve(value); }, error => { window.clearTimeout(timer); reject(error); });
+        });
+    }
     async function processPdf(file: File) {
         const id = `${Date.now()}-${file.name}`, size = `${(file.size / 1024 / 1024).toFixed(1)} MB`;
         let saved: DocumentResult | undefined;
@@ -209,7 +199,7 @@ export default function Home() {
                 if (paddleState.engine || paddleState.unavailable)
                     return Promise.resolve();
                 if (!paddleState.init)
-                    paddleState.init = (async () => {
+                    paddleState.init = withPageTimeout((async () => {
                         try {
                             const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
                                 PaddleOCR: {
@@ -221,7 +211,7 @@ export default function Home() {
                         catch {
                             paddleState.unavailable = true;
                         }
-                    })();
+                    })(), "PaddleOCR init").catch(() => { paddleState.unavailable = true; });
                 return paddleState.init;
             }
             async function runPaddle(canvas: HTMLCanvasElement) {
@@ -233,7 +223,7 @@ export default function Home() {
                     if (!engine)
                         return { text: "", confidence: 0 };
                     try {
-                        const [paddleResult] = await engine.predict(canvas);
+                        const [paddleResult] = await withPageTimeout(engine.predict(canvas), "PaddleOCR predict");
                         return normalizePaddleResult(paddleResult?.items ?? []);
                     }
                     catch {
@@ -277,41 +267,41 @@ export default function Home() {
                 let result: PageResult;
                 if (embedded.length >= 20) {
                     result = { page: n, text: embedded, method: "embedded text", status: "read", verification: "Source text layer" };
-                    page.cleanup();
-                    resultsMap.set(n, result);
-                    emit();
-                    return;
                 }
-                try {
-                    const worker = await getSlotWorker(slot);
-                    const firstScale = initial.mode === "fast" ? 1.7 : 2.2, firstCanvas = await renderOcrCanvas(page, firstScale, false), first = await worker.recognize(firstCanvas), firstText = cleanOcrText(first.data.text);
-                    const sanity = financialSanity(firstText), structured = hasReliableTransactionStructure(firstText), firstConsistency = transactionConsistency(firstText), fastAccepted = firstText.length >= 20 && sanity.passed && (initial.mode === "fast" ? (first.data.confidence >= 72 || (structured && first.data.confidence >= 45 && firstConsistency >= .97)) : first.data.confidence >= 88);
-                    if (fastAccepted) {
-                        result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Fast OCR confidence ${Math.round(first.data.confidence)}%; ${sanity.checked} financial values checked` };
-                        firstCanvas.width = 0;
-                        firstCanvas.height = 0;
-                        page.cleanup();
-                        resultsMap.set(n, result);
-                        emit();
-                        return;
+                else {
+                    try {
+                        result = await withPageTimeout((async (): Promise<PageResult> => {
+                            const worker = await getSlotWorker(slot);
+                            const firstScale = initial.mode === "fast" ? 1.7 : 2.2, firstCanvas = await renderOcrCanvas(page, firstScale, false), first = await worker.recognize(firstCanvas), firstText = cleanOcrText(first.data.text);
+                            const sanity = financialSanity(firstText), structured = hasReliableTransactionStructure(firstText), firstConsistency = transactionConsistency(firstText), fastAccepted = firstText.length >= 20 && sanity.passed && (initial.mode === "fast" ? (first.data.confidence >= 72 || (structured && first.data.confidence >= 45 && firstConsistency >= .97)) : first.data.confidence >= 88);
+                            if (fastAccepted) {
+                                firstCanvas.width = 0;
+                                firstCanvas.height = 0;
+                                return { page: n, text: firstText, method: "OCR", status: "read", verification: `Fast OCR confidence ${Math.round(first.data.confidence)}%; ${sanity.checked} financial values checked` };
+                            }
+                            const paddleOutcome = await runPaddle(firstCanvas), paddleText = paddleOutcome.text, paddleConfidence = paddleOutcome.confidence;
+                            const crossAgreement = tokenAgreement(firstText, paddleText), dualAccepted = firstText.length >= 20 && paddleText.length >= 20 && first.data.confidence >= 58 && paddleConfidence >= 72 && crossAgreement >= (initial.mode === "fast" ? .91 : .96) && sanity.passed;
+                            firstCanvas.width = 0;
+                            firstCanvas.height = 0;
+                            if (dualAccepted)
+                                return { page: n, text: firstText, method: "OCR", status: "read", verification: `Dual OCR agreement ${Math.round(crossAgreement * 100)}%; ${sanity.checked} financial values checked` };
+                            await worker.setParameters({ tessedit_pageseg_mode: "6" as never, preserve_interword_spaces: "1" });
+                            const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 2.1 : 2.6, true), second = await worker.recognize(enhancedCanvas);
+                            enhancedCanvas.width = 0;
+                            enhancedCanvas.height = 0;
+                            const secondText = cleanOcrText(second.data.text), retryAgreement = tokenAgreement(firstText, secondText), paddleRetryAgreement = Math.max(tokenAgreement(firstText, paddleText), tokenAgreement(secondText, paddleText)), secondConsistency = transactionConsistency(secondText), preferSecond = secondConsistency > firstConsistency || (secondConsistency === firstConsistency && second.data.confidence >= first.data.confidence), best = preferSecond ? second : first, bestText = cleanOcrText(best.data.text), bestSanity = financialSanity(bestText), bestStructured = hasReliableTransactionStructure(bestText), bestConsistency = Math.max(firstConsistency, secondConsistency), legacyAccepted = firstText.length >= 20 && first.data.confidence >= 62 && (!structured || firstConsistency >= .97), retryAccepted = bestText.length >= 20 && ((bestStructured && bestConsistency >= .97 && Math.max(first.data.confidence, second.data.confidence) >= 40) || (Math.max(first.data.confidence, second.data.confidence) >= 55 && retryAgreement >= (bestStructured ? .82 : .9))), verifiedRetry = paddleText.length >= 20 && paddleConfidence >= 68 && paddleRetryAgreement >= .82 && bestSanity.passed, accepted = legacyAccepted || retryAccepted || verifiedRetry;
+                            return accepted ? { page: n, text: bestText, method: "OCR", status: "read", verification: verifiedRetry ? `Dual OCR retry agreement ${Math.round(paddleRetryAgreement * 100)}%; ${bestSanity.checked} financial values checked` : legacyAccepted ? "Tesseract confidence gate" : "Tesseract retry agreement" } : { page: n, text: bestText, method: "unreadable", status: "review", verification: paddleState.unavailable ? "Second OCR unavailable; conservative review" : "OCR engines did not agree on critical values", message: `Sorry, I could not verify the financial values on page ${n}. Please review this page.` };
+                        })(), `Page ${n} OCR`);
                     }
-                    const paddleOutcome = await runPaddle(firstCanvas), paddleText = paddleOutcome.text, paddleConfidence = paddleOutcome.confidence;
-                    const crossAgreement = tokenAgreement(firstText, paddleText), dualAccepted = firstText.length >= 20 && paddleText.length >= 20 && first.data.confidence >= 58 && paddleConfidence >= 72 && crossAgreement >= (initial.mode === "fast" ? .91 : .96) && sanity.passed;
-                    firstCanvas.width = 0;
-                    firstCanvas.height = 0;
-                    if (dualAccepted)
-                        result = { page: n, text: firstText, method: "OCR", status: "read", verification: `Dual OCR agreement ${Math.round(crossAgreement * 100)}%; ${sanity.checked} financial values checked` };
-                    else {
-                        await worker.setParameters({ tessedit_pageseg_mode: "6" as never, preserve_interword_spaces: "1" });
-                        const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 2.1 : 2.6, true), second = await worker.recognize(enhancedCanvas);
-                        enhancedCanvas.width = 0;
-                        enhancedCanvas.height = 0;
-                        const secondText = cleanOcrText(second.data.text), retryAgreement = tokenAgreement(firstText, secondText), paddleRetryAgreement = Math.max(tokenAgreement(firstText, paddleText), tokenAgreement(secondText, paddleText)), secondConsistency = transactionConsistency(secondText), preferSecond = secondConsistency > firstConsistency || (secondConsistency === firstConsistency && second.data.confidence >= first.data.confidence), best = preferSecond ? second : first, bestText = cleanOcrText(best.data.text), bestSanity = financialSanity(bestText), bestStructured = hasReliableTransactionStructure(bestText), bestConsistency = Math.max(firstConsistency, secondConsistency), legacyAccepted = firstText.length >= 20 && first.data.confidence >= 62 && (!structured || firstConsistency >= .97), retryAccepted = bestText.length >= 20 && ((bestStructured && bestConsistency >= .97 && Math.max(first.data.confidence, second.data.confidence) >= 40) || (Math.max(first.data.confidence, second.data.confidence) >= 55 && retryAgreement >= (bestStructured ? .82 : .9))), verifiedRetry = paddleText.length >= 20 && paddleConfidence >= 68 && paddleRetryAgreement >= .82 && bestSanity.passed, accepted = legacyAccepted || retryAccepted || verifiedRetry;
-                        result = accepted ? { page: n, text: bestText, method: "OCR", status: "read", verification: verifiedRetry ? `Dual OCR retry agreement ${Math.round(paddleRetryAgreement * 100)}%; ${bestSanity.checked} financial values checked` : legacyAccepted ? "Tesseract confidence gate" : "Tesseract retry agreement" } : { page: n, text: bestText, method: "unreadable", status: "review", verification: paddleState.unavailable ? "Second OCR unavailable; conservative review" : "OCR engines did not agree on critical values", message: `Sorry, I could not verify the financial values on page ${n}. Please review this page.` };
+                    catch {
+                        // A slot's worker that hung or errored is not trusted again — replace it
+                        // so a single bad page can never jam every future page routed to this slot.
+                        const badWorker = workerPool[slot];
+                        workerPool[slot] = null;
+                        if (badWorker)
+                            badWorker.terminate().catch(() => undefined);
+                        result = { page: n, text: "", method: "unreadable", status: "review", message: `Sorry, I could not clearly read page ${n}. Please review this page.` };
                     }
-                }
-                catch {
-                    result = { page: n, text: "", method: "unreadable", status: "review", message: `Sorry, I could not clearly read page ${n}. Please review this page.` };
                 }
                 page.cleanup();
                 resultsMap.set(n, result);
