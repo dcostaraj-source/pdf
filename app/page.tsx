@@ -397,7 +397,17 @@ export default function Home() {
     } if (!response.ok || !data.answer?.trim())
         throw new Error(data.error ?? "The assistant did not receive a complete answer. Please try again."); return data.answer.trim(); }
     async function askQuestion(prompt = question) { const clean = prompt.trim(), document = resolveDocument(clean); if (!document || !clean || ["Processing", "Paused"].includes(document.status) || asking)
-        return; const wantsExcel = /\b(?:excel|xlsx|spreadsheet)\b/i.test(clean), wantsTable = wantsExcel || /\btable\b/i.test(clean), wantsTotal = /\b(?:total|sum|how much|payments?|credits?|debits?)\b/i.test(clean), formatRule = wantsTable ? `\nReturn exactly one complete Markdown table with clear column headings and a source PDF page in every row. Do not omit supported rows, duplicate rows, or invent missing values.` : "", totalRule = wantsTotal ? `\nFor a total, first identify the exact requested date or month. List every included entry with its date, description, amount and source page; then show the arithmetic and final total. Keep debit, credit and net totals separate where applicable. If the date, direction or evidence is ambiguous, explain what needs clarification instead of guessing.` : "", analysisPrompt = `${clean}${formatRule}${totalRule}\nTarget document: ${document.name}. Today is ${new Date().toISOString().slice(0, 10)}.`, unreadable = document.pages.filter(p => p.status === "review").map(p => p.page), selected = relevantPages(clean, document), batches = evidenceBatches(selected); setActiveId(document.id); setQuestion(""); setAsking(true); setAnalysisProgress(""); setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: clean }]); try {
+        return;
+        // Any phrasing of "head wise"/"party wise"/"narration wise" always goes through the
+        // deterministic, zero-AI table - never DeepSeek - so it can never come back as a messy
+        // arithmetic dump no matter how the question is worded, typed or clicked.
+        const groupingIntent = detectGroupingIntent(clean);
+        if (groupingIntent) {
+            setQuestion("");
+            groupedTotalsMessage(groupingIntent, document, clean);
+            return;
+        }
+        const wantsExcel = /\b(?:excel|xlsx|spreadsheet)\b/i.test(clean), wantsTable = wantsExcel || /\btable\b/i.test(clean), wantsTotal = /\b(?:total|sum|how much|payments?|credits?|debits?)\b/i.test(clean), formatRule = wantsTable ? `\nReturn exactly one complete Markdown table with clear column headings and a source PDF page in every row. Do not omit supported rows, duplicate rows, or invent missing values.` : "", totalRule = wantsTotal ? `\nFor a total, first identify the exact requested date or month. List every included entry with its date, description, amount and source page; then show the arithmetic and final total. Keep debit, credit and net totals separate where applicable. If the date, direction or evidence is ambiguous, explain what needs clarification instead of guessing.` : "", analysisPrompt = `${clean}${formatRule}${totalRule}\nTarget document: ${document.name}. Today is ${new Date().toISOString().slice(0, 10)}.`, unreadable = document.pages.filter(p => p.status === "review").map(p => p.page), selected = relevantPages(clean, document), batches = evidenceBatches(selected); setActiveId(document.id); setQuestion(""); setAsking(true); setAnalysisProgress(""); setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: clean }]); try {
         const parsed = document.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
         if (isTransactionRequest(clean) && parsed.length) {
             const answer = transactionAnswer(parsed, clean, unreadable);
@@ -435,16 +445,25 @@ export default function Home() {
     // already-extracted, already-verified page text (the same parseTransactions() rows
     // used for date/total answers elsewhere) — no DeepSeek call, so coverage can never
     // depend on page-relevance filtering or batching: every read page is always included.
-    function groupedTotalsMessage(kind: "head" | "narration") {
-        if (!active || ["Processing", "Paused"].includes(active.status))
+    function detectGroupingIntent(prompt: string): "head" | "narration" | null {
+        const lower = prompt.toLowerCase();
+        if (/\bhead[\s-]?wise\b|\bparty[\s-]?wise\b|\bcounterparty[\s-]?wise\b|\bvendor[\s-]?wise\b|\bpayee[\s-]?wise\b/.test(lower))
+            return "head";
+        if (/\bnarration[\s-]?wise\b|\bdescription[\s-]?wise\b/.test(lower))
+            return "narration";
+        return null;
+    }
+    function groupedTotalsMessage(kind: "head" | "narration", document = active, userText?: string) {
+        if (!document || ["Processing", "Paused"].includes(document.status))
             return;
-        const unreadable = active.pages.filter(p => p.status === "review").map(p => p.page);
-        const parsed = active.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
+        const unreadable = document.pages.filter(p => p.status === "review").map(p => p.page);
+        const parsed = document.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
         const groups = kind === "head" ? groupByHead(parsed) : groupByNarration(parsed);
         const title = kind === "head" ? "Head / Party" : "Narration";
         const answer = groupedTotalsAnswer(groups, title, unreadable);
-        const label = kind === "head" ? "Head-wise total" : "Narration-wise total";
-        setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: label }, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${active.name}\n\n${answer}`, exportData: { groups, title, documentName: active.name } }]);
+        const label = userText ?? (kind === "head" ? "Head-wise total" : "Narration-wise total");
+        setActiveId(document.id);
+        setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: label }, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${document.name}\n\n${answer}`, exportData: { groups, title, documentName: document.name } }]);
     }
     function downloadCanvas(canvas: HTMLCanvasElement, filename: string) {
         canvas.toBlob(blob => {
