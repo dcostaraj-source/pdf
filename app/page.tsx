@@ -45,7 +45,7 @@ type ChatMessage = {
     text: string;
     exportData?: { groups: GroupedTotal[]; title: string; documentName: string };
 };
-const specialists = [["01", "Page Guard", "Accounts for every page"], ["02", "Dual Local OCR", "Two engines read difficult scans"], ["03", "Financial Guard", "Checks critical values before acceptance"], ["04", "DeepSeek Analyst", "Answers only from PDF evidence"], ["05", "Total Reports", "Head-wise and narration-wise tables, computed from every page"]];
+const specialists = [["01", "Page Guard", "Accounts for every page"], ["02", "Two-Pass Local OCR", "Reads twice and cross-checks difficult scans"], ["03", "Financial Guard", "Checks critical values before acceptance"], ["04", "DeepSeek Analyst", "Answers only from PDF evidence"], ["05", "Total Reports", "Head-wise and narration-wise tables, computed from every page"]];
 const welcome: ChatMessage = { id: "welcome", role: "assistant", text: "Welcome. Upload a PDF, then ask me anything about it. I will cite page numbers and tell you when evidence is unclear." };
 function inlineFormat(text: string): ReactNode[] { return text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean).map((part, index) => part.startsWith("**") && part.endsWith("**") ? <strong key={index}>{part.slice(2, -2)}</strong> : part); }
 function looksNumericCell(cell: string) { const stripped = cell.replace(/\*\*/g, "").trim(); return stripped === "" || stripped === "—" || stripped === "-" || /^[+-]?₹?\s?[\d,]+(\.\d+)?%?$/.test(stripped); }
@@ -198,6 +198,7 @@ export default function Home() {
             counts.set(token, count - 1);
         }
     } return Math.max(a.length, b.length) ? matched / Math.max(a.length, b.length) : 0; }
+    // Kept for when PaddleOCR is reintroduced later; not called while it is disabled (see runPaddle).
     function normalizePaddleResult(items: PaddleItem[]) { const sorted = [...items].sort((a, b) => { const ay = Math.min(...a.poly.map(p => p[1])), by = Math.min(...b.poly.map(p => p[1])); if (Math.abs(ay - by) > 18)
         return ay - by; return Math.min(...a.poly.map(p => p[0])) - Math.min(...b.poly.map(p => p[0])); }); const text = cleanOcrText(sorted.map(item => item.text).join(" ")); const confidence = sorted.length ? sorted.reduce((sum, item) => sum + item.score, 0) / sorted.length * 100 : 0; return { text, confidence }; }
     function financialSanity(text: string) { const markers = text.match(/\b\d[\d,]*\.\d{2}\s*\(?(?:CR|DR)\)?\b/gi) ?? []; const impossible = markers.some(value => !Number.isFinite(Number(value.replace(/\(?(?:cr|dr)\)?/ig, "").replace(/,/g, "").trim()))); return { checked: markers.length, passed: !impossible }; }
@@ -264,55 +265,16 @@ export default function Home() {
                 return workerPool[slot]!;
             }
 
-            // PaddleOCR is a single shared engine (its own model session), so predict calls
-            // are serialized through paddleChain even though Tesseract runs in parallel.
-            // Its first-use model/WASM download can take minutes on a slow connection - no
-            // page may ever wait on that download as part of its own safety timer, or a slow
-            // connection would time out every page trying to use it. So initialization is
-            // kicked off once, eagerly, in the background with its own generous budget. Pages
-            // that need it join that single shared promise (never re-triggering the download)
-            // and wait up to a bounded amount of time for it - long enough that a normal-speed
-            // download is actually used by nearly every page, short enough that no page's own
-            // safety timer is ever put at risk by a slow or stuck download.
-            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; chain: Promise<unknown>; ready: Promise<void> } = { engine: null, unavailable: false, chain: Promise.resolve(), ready: Promise.resolve() };
-            paddleState.ready = withPageTimeout((async () => {
-                try {
-                    const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
-                        PaddleOCR: {
-                            create: (options: Record<string, unknown>) => Promise<PaddleEngine>;
-                        };
-                    }>, { PaddleOCR } = await loadPaddle();
-                    paddleState.engine = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
-                    console.info("[PaddleOCR] second OCR engine ready");
-                }
-                catch (err) {
-                    paddleState.unavailable = true;
-                    console.warn("[PaddleOCR] second OCR engine failed to load - continuing with primary OCR only:", err);
-                }
-            })(), "PaddleOCR init", 120_000).catch(err => { paddleState.unavailable = true; console.warn("[PaddleOCR] second OCR engine init timed out - continuing with primary OCR only:", err); });
-            async function runPaddle(canvas: HTMLCanvasElement) {
-                if (!paddleState.engine && !paddleState.unavailable)
-                    await Promise.race([paddleState.ready, new Promise<void>(resolve => setTimeout(resolve, 25_000))]).catch(() => undefined);
-                if (!paddleState.engine)
-                    return { text: "", confidence: 0 };
-                const task = paddleState.chain.then(async () => {
-                    const engine = paddleState.engine;
-                    if (!engine)
-                        return { text: "", confidence: 0 };
-                    try {
-                        const predictJob = engine.predict(canvas); predictJob.catch(() => undefined);
-                        const [paddleResult] = await withPageTimeout(predictJob, "PaddleOCR predict");
-                        return normalizePaddleResult(paddleResult?.items ?? []);
-                    }
-                    catch {
-                        paddleState.unavailable = true;
-                        paddleState.engine = null;
-                        await engine.dispose().catch(() => undefined);
-                        return { text: "", confidence: 0 };
-                    }
-                });
-                paddleState.chain = task.then(() => undefined, () => undefined);
-                return task;
+            // The second OCR engine (PaddleOCR) has caused three consecutive regressions in
+            // a row - a shared single-instance engine that every page needed a turn with,
+            // which on documents where most pages need it turned into a queue that ate each
+            // page's own safety timer, causing both slow processing and widespread false
+            // review flags. Disabled for now until it can be redesigned and tested properly;
+            // every page relies solely on the primary engine's own two-pass confidence and
+            // cross-pass agreement checks below, exactly as it did in the reliable version.
+            const paddleState: { engine: PaddleEngine | null; unavailable: boolean } = { engine: null, unavailable: true };
+            async function runPaddle(): Promise<{ text: string; confidence: number }> {
+                return { text: "", confidence: 0 };
             }
 
             // Completed pages land here (possibly out of order); emit() only advances the
@@ -357,7 +319,7 @@ export default function Home() {
                                 firstCanvas.height = 0;
                                 return { page: n, text: firstText, method: "OCR", status: "read", verification: `Fast OCR confidence ${Math.round(first.data.confidence)}%; ${sanity.checked} financial values checked` };
                             }
-                            const paddleOutcome = await runPaddle(firstCanvas), paddleText = paddleOutcome.text, paddleConfidence = paddleOutcome.confidence;
+                            const paddleOutcome = await runPaddle(), paddleText = paddleOutcome.text, paddleConfidence = paddleOutcome.confidence;
                             const crossAgreement = tokenAgreement(firstText, paddleText), dualAccepted = firstText.length >= 20 && paddleText.length >= 20 && first.data.confidence >= 58 && paddleConfidence >= 72 && crossAgreement >= (initial.mode === "fast" ? .91 : .96) && sanity.passed;
                             firstCanvas.width = 0;
                             firstCanvas.height = 0;
