@@ -48,20 +48,31 @@ type ChatMessage = {
 const specialists = [["01", "Page Guard", "Accounts for every page"], ["02", "Dual Local OCR", "Two engines read difficult scans"], ["03", "Financial Guard", "Checks critical values before acceptance"], ["04", "DeepSeek Analyst", "Answers only from PDF evidence"], ["05", "Total Reports", "Head-wise and narration-wise tables, computed from every page"]];
 const welcome: ChatMessage = { id: "welcome", role: "assistant", text: "Welcome. Upload a PDF, then ask me anything about it. I will cite page numbers and tell you when evidence is unclear." };
 function inlineFormat(text: string): ReactNode[] { return text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean).map((part, index) => part.startsWith("**") && part.endsWith("**") ? <strong key={index}>{part.slice(2, -2)}</strong> : part); }
+function looksNumericCell(cell: string) { const stripped = cell.replace(/\*\*/g, "").trim(); return stripped === "" || stripped === "—" || stripped === "-" || /^[+-]?₹?\s?[\d,]+(\.\d+)?%?$/.test(stripped); }
 function AssistantContent({ text }: {
     text: string;
 }) { const lines = text.replace(/\r/g, "").split("\n"), content: ReactNode[] = []; for (let i = 0; i < lines.length;) {
     const line = lines[i].trim();
     if (line.startsWith("|") && line.endsWith("|")) {
         const table: string[][] = [];
+        let aligns: Array<"left" | "right" | "center" | undefined> = [];
         while (i < lines.length && lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|")) {
             const cells = lines[i].trim().split("|").slice(1, -1).map(cell => cell.trim());
-            if (!cells.every(cell => /^:?-{3,}:?$/.test(cell)))
+            if (cells.every(cell => /^:?-{3,}:?$/.test(cell)))
+                aligns = cells.map(cell => cell.startsWith(":") && cell.endsWith(":") ? "center" : cell.endsWith(":") ? "right" : cell.startsWith(":") ? "left" : undefined);
+            else
                 table.push(cells);
             i++;
         }
         if (table.length) {
-            content.push(<div className="assistantTableWrap" key={`table-${i}`}><table className="assistantTable"><thead><tr>{table[0].map((cell, column) => <th key={column}>{inlineFormat(cell)}</th>)}</tr></thead><tbody>{table.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{table[0].map((_, column) => <td key={column}>{inlineFormat(row[column] ?? "")}</td>)}</tr>)}</tbody></table></div>);
+            // Numbers must line up on the right, decimal points stacked, never jagged
+            // left-aligned text. Explicit markdown alignment markers (:---, ---:) win;
+            // a column where every data cell looks numeric/currency is right-aligned
+            // even without one, since not every table (DeepSeek's included) always
+            // includes the marker.
+            const dataRows = table.slice(1);
+            const columnAlign = (column: number): "left" | "right" | "center" | undefined => aligns[column] ?? (dataRows.length && dataRows.every(row => looksNumericCell(row[column] ?? "")) && dataRows.some(row => (row[column] ?? "").replace(/\*\*/g, "").trim().match(/\d/)) ? "right" : undefined);
+            content.push(<div className="assistantTableWrap" key={`table-${i}`}><table className="assistantTable"><thead><tr>{table[0].map((cell, column) => <th key={column} style={{ textAlign: columnAlign(column) }}>{inlineFormat(cell)}</th>)}</tr></thead><tbody>{table.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{table[0].map((_, column) => <td key={column} style={{ textAlign: columnAlign(column) }}>{inlineFormat(row[column] ?? "")}</td>)}</tr>)}</tbody></table></div>);
         }
         continue;
     }
@@ -89,8 +100,11 @@ export default function Home() {
     const [expandedPages, setExpandedPages] = useState<Set<number>>(new Set());
     function togglePageText(page: number) { setExpandedPages(current => { const next = new Set(current); if (next.has(page)) next.delete(page); else next.add(page); return next; }); }
     // Green/yellow/red at a glance so the CA's eye goes straight to the handful of
-    // pages that actually need a look, not all of them. Reuses the confidence/agreement
-    // percentage already recorded in verification text - no new OCR data needed.
+    // pages that actually need a look, not all of them. Red is reserved strictly for
+    // pages genuinely flagged for review - a page that was successfully read and
+    // accepted is never red, no matter how low its raw confidence number was, because
+    // it already passed a real acceptance gate (structure, dual-engine agreement, or
+    // retry consensus) that a bare percentage doesn't capture on its own.
     function pageConfidenceClass(p: PageResult) {
         if (p.status === "review")
             return "confRed";
@@ -99,11 +113,7 @@ export default function Home() {
         const pct = Number(p.verification?.match(/(\d+)%/)?.[1]);
         if (!Number.isFinite(pct))
             return "confGreen";
-        if (pct >= 90)
-            return "confGreen";
-        if (pct >= 70)
-            return "confYellow";
-        return "confRed";
+        return pct >= 85 ? "confGreen" : "confYellow";
     }
     const controlRef = useRef<Record<string, "running" | "paused" | "cancelled">>({}), uploadCounterRef = useRef(0);
     // Kept in memory only (never persisted/serialized to localStorage - a full PDF's
@@ -467,7 +477,7 @@ export default function Home() {
             groupedTotalsMessage(groupingIntent, document, clean);
             return;
         }
-        const wantsExcel = /\b(?:excel|xlsx|spreadsheet)\b/i.test(clean), wantsTable = wantsExcel || /\btable\b/i.test(clean), wantsTotal = /\b(?:total|sum|how much|payments?|credits?|debits?)\b/i.test(clean), formatRule = wantsTable ? `\nReturn exactly one complete Markdown table with clear column headings and a source PDF page in every row. Do not omit supported rows, duplicate rows, or invent missing values.` : "", totalRule = wantsTotal ? `\nFor a total, first identify the exact requested date or month. List every included entry with its date, description, amount and source page; then show the arithmetic and final total. Keep debit, credit and net totals separate where applicable. If the date, direction or evidence is ambiguous, explain what needs clarification instead of guessing.` : "", analysisPrompt = `${clean}${formatRule}${totalRule}\nTarget document: ${document.name}. Today is ${new Date().toISOString().slice(0, 10)}.`, unreadable = document.pages.filter(p => p.status === "review").map(p => p.page), selected = relevantPages(clean, document), batches = evidenceBatches(selected); setActiveId(document.id); setQuestion(""); setAsking(true); setAnalysisProgress(""); setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: clean }]); try {
+        const wantsExcel = /\b(?:excel|xlsx|spreadsheet)\b/i.test(clean), wantsTable = wantsExcel || /\btable\b/i.test(clean), wantsTotal = /\b(?:total|sum|how much|payments?|credits?|debits?)\b/i.test(clean), formatRule = wantsTable ? `\nReturn exactly one complete Markdown table with clear column headings and a source PDF page in every row. Right-align every numeric/amount column using the standard Markdown alignment syntax (a header separator cell written as ---: for that column). Do not omit supported rows, duplicate rows, or invent missing values.` : "", totalRule = wantsTotal ? `\nFor a total, first identify the exact requested date or month. List every included entry with its date, description, amount and source page; then show the arithmetic and final total. Keep debit, credit and net totals separate where applicable. If the date, direction or evidence is ambiguous, explain what needs clarification instead of guessing.` : "", analysisPrompt = `${clean}${formatRule}${totalRule}\nTarget document: ${document.name}. Today is ${new Date().toISOString().slice(0, 10)}.`, unreadable = document.pages.filter(p => p.status === "review").map(p => p.page), selected = relevantPages(clean, document), batches = evidenceBatches(selected); setActiveId(document.id); setQuestion(""); setAsking(true); setAnalysisProgress(""); setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: clean }]); try {
         const parsed = document.pages.filter(page => page.status === "read").flatMap(page => parseTransactions(page.text, page.page));
         if (isTransactionRequest(clean) && parsed.length) {
             const answer = transactionAnswer(parsed, clean, unreadable);
@@ -525,173 +535,48 @@ export default function Home() {
         setActiveId(document.id);
         setMessages(c => [...c, { id: `${Date.now()}-u`, role: "user", text: label }, { id: `${Date.now()}-a`, role: "assistant", text: `Document: ${document.name}\n\n${answer}`, exportData: { groups, title, documentName: document.name } }]);
     }
-    function downloadCanvas(canvas: HTMLCanvasElement, filename: string) {
-        canvas.toBlob(blob => {
-            if (!blob)
-                return;
-            const url = URL.createObjectURL(blob), link = document.createElement("a");
-            link.href = url;
-            link.download = filename;
-            link.click();
-            URL.revokeObjectURL(url);
-        }, "image/png");
+    function escapeHtml(value: string) {
+        return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     }
-    function fitText(context: CanvasRenderingContext2D, text: string, maxWidth: number) {
-        if (context.measureText(text).width <= maxWidth)
-            return text;
-        let low = 0, high = text.length;
-        while (low < high) {
-            const mid = Math.ceil((low + high) / 2);
-            if (context.measureText(`${text.slice(0, mid)}…`).width <= maxWidth)
-                low = mid;
-            else
-                high = mid - 1;
-        }
-        return `${text.slice(0, low)}…`;
-    }
-    function exportGroupedImage(groups: GroupedTotal[], title: string, documentName: string) {
+    // A canvas image has a fixed pixel size, which breaks down once a table has enough
+    // rows (a real head-wise breakdown can easily run past what fits one PNG cleanly).
+    // A real HTML page in its own tab has no such ceiling - any number of rows, still
+    // scrollable and printable, same dark report look as the client's reference.
+    function openGroupedTable(groups: GroupedTotal[], title: string, documentName: string) {
         if (!groups.length)
             return;
-        const scale = 2, width = 900 * scale, rowHeight = 46 * scale, headerHeight = 92 * scale, colHeadHeight = 42 * scale, footerHeight = 56 * scale;
-        const height = headerHeight + colHeadHeight + groups.length * rowHeight + rowHeight + footerHeight;
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx)
-            return;
-        const colors = { bg: "#0b1220", headBg: "#101c30", line: "#1f2b40", text: "#e7ecf3", muted: "#8a97ab", gold: "#d5b06c", green: "#3ecf8e", red: "#f2685c", rowAlt: "#0e1728" };
-        ctx.fillStyle = colors.bg;
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = colors.text;
-        ctx.font = `700 ${26 * scale}px Georgia, serif`;
-        ctx.textBaseline = "alphabetic";
-        ctx.fillText(`${title} Report`, 26 * scale, 40 * scale);
-        ctx.fillStyle = colors.muted;
-        ctx.font = `${13 * scale}px Inter, sans-serif`;
-        ctx.fillText(`${documentName} · Harish Acharya & Co · ${new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" })}`, 26 * scale, 62 * scale);
-        ctx.strokeStyle = colors.gold;
-        ctx.lineWidth = 2 * scale;
-        ctx.beginPath();
-        ctx.moveTo(26 * scale, 74 * scale);
-        ctx.lineTo(width - 26 * scale, 74 * scale);
-        ctx.stroke();
-        const labelX = 26 * scale, labelMaxWidth = width * 0.46 - labelX - 10 * scale, debitX = width * 0.63, creditX = width * 0.81, netX = width - 26 * scale;
-        let y = headerHeight;
-        ctx.fillStyle = colors.headBg;
-        ctx.fillRect(0, y, width, colHeadHeight);
-        ctx.fillStyle = colors.muted;
-        ctx.font = `700 ${13 * scale}px Inter, sans-serif`;
-        ctx.textAlign = "left";
-        ctx.fillText(title.toUpperCase(), labelX, y + colHeadHeight / 2 + 5 * scale);
-        ctx.textAlign = "right";
-        ctx.fillText("DEBIT ₹", debitX, y + colHeadHeight / 2 + 5 * scale);
-        ctx.fillText("CREDIT ₹", creditX, y + colHeadHeight / 2 + 5 * scale);
-        ctx.fillText("NET ₹", netX, y + colHeadHeight / 2 + 5 * scale);
-        y += colHeadHeight;
-        groups.forEach((g, i) => {
-            if (i % 2 === 1) {
-                ctx.fillStyle = colors.rowAlt;
-                ctx.fillRect(0, y, width, rowHeight);
-            }
-            ctx.fillStyle = colors.text;
-            ctx.font = `${14 * scale}px Inter, sans-serif`;
-            ctx.textAlign = "left";
-            ctx.fillText(fitText(ctx, g.key, labelMaxWidth), labelX, y + rowHeight / 2 + 5 * scale);
-            ctx.textAlign = "right";
-            ctx.fillStyle = colors.muted;
-            ctx.fillText(g.debit ? formatCurrency(g.debit) : "—", debitX, y + rowHeight / 2 + 5 * scale);
-            ctx.fillText(g.credit ? formatCurrency(g.credit) : "—", creditX, y + rowHeight / 2 + 5 * scale);
-            ctx.fillStyle = g.net >= 0 ? colors.green : colors.red;
-            ctx.font = `700 ${14 * scale}px Inter, sans-serif`;
-            ctx.fillText(`${g.net >= 0 ? "+" : "-"}${formatCurrency(Math.abs(g.net))}`, netX, y + rowHeight / 2 + 5 * scale);
-            y += rowHeight;
-        });
         const totalDebit = groups.reduce((s, g) => s + g.debit, 0), totalCredit = groups.reduce((s, g) => s + g.credit, 0), totalNet = totalCredit - totalDebit;
-        ctx.strokeStyle = colors.gold;
-        ctx.lineWidth = 1.5 * scale;
-        ctx.beginPath();
-        ctx.moveTo(labelX, y);
-        ctx.lineTo(width - labelX, y);
-        ctx.stroke();
-        ctx.font = `700 ${15 * scale}px Inter, sans-serif`;
-        ctx.textAlign = "left";
-        ctx.fillStyle = colors.text;
-        ctx.fillText("TOTAL", labelX, y + rowHeight / 2 + 5 * scale);
-        ctx.textAlign = "right";
-        ctx.fillText(formatCurrency(totalDebit), debitX, y + rowHeight / 2 + 5 * scale);
-        ctx.fillText(formatCurrency(totalCredit), creditX, y + rowHeight / 2 + 5 * scale);
-        ctx.fillStyle = totalNet >= 0 ? colors.green : colors.red;
-        ctx.fillText(`${totalNet >= 0 ? "+" : "-"}${formatCurrency(Math.abs(totalNet))}`, netX, y + rowHeight / 2 + 5 * scale);
-        y += rowHeight;
-        ctx.fillStyle = colors.muted;
-        ctx.font = `${11 * scale}px Inter, sans-serif`;
-        ctx.textAlign = "left";
-        ctx.fillText("Computed locally from every readable page. This is a review aid — verify against the source PDF.", labelX, y + 24 * scale);
-        downloadCanvas(canvas, `${documentName.replace(/\.pdf$/i, "")}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-report.png`);
-    }
-    function exportGroupedChart(groups: GroupedTotal[], title: string, documentName: string) {
-        if (!groups.length)
-            return;
-        const shown = groups.slice(0, 12), truncated = groups.length > shown.length;
-        const scale = 2, width = 1000 * scale, rowHeight = 50 * scale, headerHeight = 92 * scale, footerHeight = truncated ? 70 * scale : 50 * scale;
-        const height = headerHeight + shown.length * rowHeight + footerHeight;
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx)
-            return;
-        const colors = { bg: "#0b1220", text: "#e7ecf3", muted: "#8a97ab", gold: "#d5b06c", green: "#3ecf8e", red: "#f2685c", zero: "#33415a" };
-        ctx.fillStyle = colors.bg;
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = colors.text;
-        ctx.font = `700 ${26 * scale}px Georgia, serif`;
-        ctx.textAlign = "left";
-        ctx.fillText(`${title} — Net by ${title.split(" ")[0]}`, 26 * scale, 40 * scale);
-        ctx.fillStyle = colors.muted;
-        ctx.font = `${13 * scale}px Inter, sans-serif`;
-        ctx.fillText(`${documentName} · Harish Acharya & Co · ${new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" })}`, 26 * scale, 62 * scale);
-        ctx.strokeStyle = colors.gold;
-        ctx.lineWidth = 2 * scale;
-        ctx.beginPath();
-        ctx.moveTo(26 * scale, 74 * scale);
-        ctx.lineTo(width - 26 * scale, 74 * scale);
-        ctx.stroke();
-        const labelColW = 250 * scale, valueColW = 160 * scale, barAreaX0 = 26 * scale + labelColW, barAreaX1 = width - 26 * scale - valueColW, barCenter = barAreaX0 + (barAreaX1 - barAreaX0) * 0.5, barHalfWidth = Math.min(barCenter - barAreaX0, barAreaX1 - barCenter);
-        const maxAbs = Math.max(...shown.map(g => Math.abs(g.net)), 1);
-        ctx.strokeStyle = colors.zero;
-        ctx.lineWidth = 1 * scale;
-        ctx.beginPath();
-        ctx.moveTo(barCenter, headerHeight);
-        ctx.lineTo(barCenter, headerHeight + shown.length * rowHeight);
-        ctx.stroke();
-        let y = headerHeight;
-        shown.forEach(g => {
-            const barLen = (Math.abs(g.net) / maxAbs) * (barHalfWidth - 8 * scale), positive = g.net >= 0, barY = y + rowHeight * 0.32, barH = rowHeight * 0.36;
-            ctx.fillStyle = colors.text;
-            ctx.font = `${13 * scale}px Inter, sans-serif`;
-            ctx.textAlign = "left";
-            ctx.fillText(fitText(ctx, g.key, labelColW - 14 * scale), 26 * scale, y + rowHeight / 2 + 5 * scale);
-            ctx.fillStyle = positive ? colors.green : colors.red;
-            ctx.fillRect(positive ? barCenter : barCenter - barLen, barY, barLen, barH);
-            ctx.font = `700 ${13 * scale}px Inter, sans-serif`;
-            ctx.textAlign = "right";
-            ctx.fillText(`${positive ? "+" : "-"}${formatCurrency(Math.abs(g.net))}`, width - 26 * scale, y + rowHeight / 2 + 5 * scale);
-            y += rowHeight;
-        });
-        ctx.fillStyle = colors.muted;
-        ctx.font = `${11 * scale}px Inter, sans-serif`;
-        ctx.textAlign = "left";
-        let footY = y + 24 * scale;
-        if (truncated) {
-            ctx.fillText(`Showing the ${shown.length} largest of ${groups.length} rows by size — export the table view above for every row.`, 26 * scale, footY);
-            footY += 18 * scale;
-        }
-        ctx.fillText("Computed locally from every readable page. This is a review aid — verify against the source PDF.", 26 * scale, footY);
-        downloadCanvas(canvas, `${documentName.replace(/\.pdf$/i, "")}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-chart.png`);
+        const rowsHtml = groups.map(g => `<tr><td>${escapeHtml(g.key)}</td><td class="num">${g.debit ? formatCurrency(g.debit) : "—"}</td><td class="num">${g.credit ? formatCurrency(g.credit) : "—"}</td><td class="num ${g.net >= 0 ? "pos" : "neg"}">${g.net >= 0 ? "+" : "-"}${formatCurrency(Math.abs(g.net))}</td></tr>`).join("");
+        const generatedOn = new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "long", year: "numeric" });
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${escapeHtml(title)} Report — ${escapeHtml(documentName)}</title><style>
+body{margin:0;padding:40px;background:#0b1220;color:#e7ecf3;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
+h1{font:400 28px/1.2 Georgia,serif;margin:0 0 4px}
+.sub{color:#8a97ab;font-size:13px;margin:0 0 18px}
+hr{border:0;border-top:2px solid #d5b06c;margin:0 0 18px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:#8a97ab;font-size:12px;font-weight:700;padding:11px 10px;background:#101c30;position:sticky;top:0}
+th.num,td.num{text-align:right}
+td{padding:12px 10px;border-top:1px solid #1f2b40;font-size:14px}
+tbody tr:nth-child(even) td{background:#0e1728}
+tfoot td{border-top:2px solid #d5b06c;font-weight:700;padding-top:14px}
+.pos{color:#3ecf8e}.neg{color:#f2685c}
+.foot{color:#8a97ab;font-size:11px;margin-top:16px}
+@media print{body{padding:0;background:white;color:black}th{background:#eee!important;color:#333}td{border-color:#ddd}.pos{color:#127a4f}.neg{color:#9c2f28}}
+</style></head><body>
+<h1>${escapeHtml(title)} Report</h1>
+<p class="sub">${escapeHtml(documentName)} · Harish Acharya &amp; Co · ${generatedOn}</p>
+<hr>
+<table><thead><tr><th>${escapeHtml(title)}</th><th class="num">Debit ₹</th><th class="num">Credit ₹</th><th class="num">Net ₹</th></tr></thead>
+<tbody>${rowsHtml}</tbody>
+<tfoot><tr><td>TOTAL</td><td class="num">${formatCurrency(totalDebit)}</td><td class="num">${formatCurrency(totalCredit)}</td><td class="num ${totalNet >= 0 ? "pos" : "neg"}">${totalNet >= 0 ? "+" : "-"}${formatCurrency(Math.abs(totalNet))}</td></tr></tfoot>
+</table>
+<p class="foot">Computed locally from every readable page — nothing sampled or left out. This is a review aid; verify against the source PDF.</p>
+</body></html>`;
+        const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+        window.open(url, "_blank");
     }
     const progress = active?.totalPages ? Math.round(active.processedPages / active.totalPages * 100) : 0;
+    const lowerConfidencePages = active?.pages.filter(p => p.status === "read" && pageConfidenceClass(p) === "confYellow") ?? [];
     if (showSplash)
         return <main className="splash"><div className="splashGlow"/><div className="splashSeal">HA</div><p>HARISH ACHARYA & CO</p><h1>Clarity for every page.</h1><span>Preparing your private document workspace</span><div className="loadingTrack"><i /></div><small>Documents deserve care. Numbers deserve certainty.</small></main>;
     return <main className="shell" ref={topRef}>
@@ -703,7 +588,7 @@ export default function Home() {
       <section className="metrics"><article><span>PDF pages</span><strong>{totals.pages}</strong><small>Received</small></article><article><span>Pages processed</span><strong>{totals.processed}</strong><small className="good">Tracked one by one</small></article><article><span>Needs review</span><strong>{totals.review}</strong><small className={totals.review ? "warn" : "good"}>{totals.review ? "Never guessed" : "Nothing flagged"}</small></article><article><span>Active progress</span><strong>{progress}%</strong><small>{active?.status ?? "Waiting for PDF"}</small></article></section>
       <section className="workspaceGrid"><div className="mainColumn">
         <section className="panel anchorSection" ref={documentsRef}><div className="panelHead"><div><span className="sectionTag">DOCUMENT DESK</span><h2>Documents</h2><p>Each upload receives a permanent PDF number. Select one, use its filename, or ask about “PDF 1”.</p></div><button className="miniAction" onClick={() => inputRef.current?.click()}>Add another</button></div><div>{documents.length === 0 && <button className="emptyState" onClick={() => inputRef.current?.click()}><strong>No documents yet</strong><span>Choose a PDF to begin real page processing.</span></button>}{documents.map(doc => { const pct = doc.totalPages ? Math.round(doc.processedPages / doc.totalPages * 100) : 0; return <button key={doc.id} className={`documentRow ${active?.id === doc.id ? "selected" : ""}`} onClick={() => { setActiveId(doc.id); setMessages([welcome]); }}><span className="pdfIcon">{doc.uploadNumber}</span><span className="docInfo"><strong>PDF {doc.uploadNumber} · {doc.name}</strong><small>{doc.processedPages} of {doc.totalPages || "?"} pages · {doc.size}</small></span><span className="progressWrap"><span><i style={{ width: `${pct}%` }}/></span><small>{pct}%</small></span><span className={`status ${doc.status === "Ready" ? "verified" : doc.status === "Review" ? "review" : "processing"}`}>{doc.status}</span><span className="chevron">›</span></button>; })}</div></section>
-        <section className="panel chatPanel"><div className="chatHead"><div><span className="botAvatar">HA</span><div><span className="sectionTag">DOCUMENT ASSISTANT</span><h2>Ask Harish Acharya Assistant</h2></div></div><span className="online"><i /> {active ? active.status : "Waiting"}</span></div><div className="chatMessages">{messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "assistant" ? "HA" : "You"}</span><div>{m.role === "assistant" ? <AssistantContent text={m.text}/> : <p>{m.text}</p>}{m.exportData && <div className="exportRow"><button onClick={() => exportGroupedImage(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as image</button><button onClick={() => exportGroupedChart(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⬇ Save as chart</button></div>}</div></div>)}{asking && <div className="message assistant"><span>HA</span><p className="typing"><i /><i /><i /></p></div>}<div ref={chatEndRef}/></div>{active?.pages.some(p => p.status === "review") && <div className="warningBanner"><strong>{active.pages.filter(p => p.status === "review").length} pages need review:</strong> {active.pages.filter(p => p.status === "review").map(p => p.page).join(", ")}. These pages are excluded from answers until the CA checks them.</div>}<div className="suggestions"><button onClick={() => askQuestion("Summarise this document with page references")}>Summarise with sources</button><button onClick={() => askQuestion("Create one clean table of the important entries, with a source page in every row")}>Create a table</button><button onClick={() => askQuestion("Identify possible inconsistencies without guessing")}>Find inconsistencies</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("head")}>Head-wise total</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("narration")}>Narration-wise total</button></div><div className="questionBox"><textarea aria-label="Ask a question about the PDF" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleQuestionKey} placeholder={active ? "Ask anything about this PDF…" : "Upload and select a PDF first…"}/><button disabled={!active || asking || ["Processing", "Paused"].includes(active.status) || !question.trim()} onClick={() => askQuestion()} aria-label="Send question">Send</button></div><p className="chatNote">Answers use extracted evidence. Verify flagged pages and important totals before approval.</p></section>
+        <section className="panel chatPanel"><div className="chatHead"><div><span className="botAvatar">HA</span><div><span className="sectionTag">DOCUMENT ASSISTANT</span><h2>Ask Harish Acharya Assistant</h2></div></div><span className="online"><i /> {active ? active.status : "Waiting"}</span></div><div className="chatMessages">{messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "assistant" ? "HA" : "You"}</span><div>{m.role === "assistant" ? <AssistantContent text={m.text}/> : <p>{m.text}</p>}{m.exportData && <div className="exportRow"><button onClick={() => openGroupedTable(m.exportData!.groups, m.exportData!.title, m.exportData!.documentName)}>⤢ Open full table in new tab</button></div>}</div></div>)}{asking && <div className="message assistant"><span>HA</span><p className="typing"><i /><i /><i /></p></div>}<div ref={chatEndRef}/></div>{active?.pages.some(p => p.status === "review") && <div className="warningBanner"><strong>{active.pages.filter(p => p.status === "review").length} pages need review:</strong> {active.pages.filter(p => p.status === "review").map(p => p.page).join(", ")}. These pages are excluded from answers until the CA checks them.</div>}{lowerConfidencePages.length > 0 && <div className="infoBanner"><strong>{lowerConfidencePages.length} page{lowerConfidencePages.length === 1 ? "" : "s"} read at lower OCR confidence, verified by matching the account balance:</strong> {lowerConfidencePages.map(p => p.page).join(", ")}. Already included in every answer — worth a quick look in Page Audit only if you want extra certainty.</div>}<div className="suggestions"><button onClick={() => askQuestion("Summarise this document with page references")}>Summarise with sources</button><button onClick={() => askQuestion("Create one clean table of the important entries, with a source page in every row")}>Create a table</button><button onClick={() => askQuestion("Identify possible inconsistencies without guessing")}>Find inconsistencies</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("head")}>Head-wise total</button><button disabled={!active || ["Processing", "Paused"].includes(active.status)} onClick={() => groupedTotalsMessage("narration")}>Narration-wise total</button></div><div className="questionBox"><textarea aria-label="Ask a question about the PDF" value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleQuestionKey} placeholder={active ? "Ask anything about this PDF…" : "Upload and select a PDF first…"}/><button disabled={!active || asking || ["Processing", "Paused"].includes(active.status) || !question.trim()} onClick={() => askQuestion()} aria-label="Send question">Send</button></div><p className="chatNote">Answers use extracted evidence. Verify flagged pages and important totals before approval.</p></section>
         <section className="panel anchorSection" ref={pageAuditRef}><div className="panelHead"><div><span className="sectionTag">PAGE AUDIT</span><h2>Every page, laid out to check</h2><p>Page number, how it was read, and the exact text pulled from it. Open any page and compare it against the original PDF yourself.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to see its page audit here</button>}{active && <><p className="pageAuditHeader">Total pages detected: <strong>{active.totalPages || "…"}</strong> · Pages processed: <strong>{active.pages.length}</strong> · Status: <strong>{active.totalPages ? Math.round(active.pages.length / active.totalPages * 100) : 0}% verified</strong></p><div className="pageAudit">{active.pages.map(p => <div key={p.page}><button className="pageAuditRow" onClick={() => { const opening = !expandedPages.has(p.page); togglePageText(p.page); if (opening) loadPageImage(active.id, p.page); }}><span><i className={`confDot ${pageConfidenceClass(p)}`}/>PAGE {p.page}</span><span>{p.method}</span><span className={`status ${p.status === "read" ? "verified" : "review"}`}>{p.status === "read" ? "Read" : "Review"}</span><span className="pageAuditNote">{p.verification ?? p.message ?? ""}</span><span className="chevron">{expandedPages.has(p.page) ? "︿" : "﹀"}</span></button>{expandedPages.has(p.page) && <div className="pageAuditText">{pageImages[`${active.id}-${p.page}`] ? <img className="pageAuditImage" src={pageImages[`${active.id}-${p.page}`]} alt={`Original scan of page ${p.page}`}/> : loadingPageImages.has(`${active.id}-${p.page}`) ? <p className="pageAuditImageLoading">Loading the original page image…</p> : null}{p.text.trim() || "No text was extracted from this page."}</div>}</div>)}{active.pages.length < active.totalPages && <p className="pageAuditNote" style={{ padding: "12px 20px", margin: 0 }}>Still reading — {active.totalPages - active.pages.length} page{active.totalPages - active.pages.length === 1 ? "" : "s"} remaining.</p>}</div></>}</section>
       </div><aside className="rightColumn"><section className="panel"><div className="panelHead"><div><span className="sectionTag">CONTROLLED WORKFLOW</span><h2>Five careful stages</h2></div></div><div className="specialists">{specialists.map(([n, name, desc]) => <div className="specialist" key={n}><span>{n}</span><div><strong>{name}</strong><p>{desc}</p><small>✓ Evidence preserved</small></div></div>)}</div></section>
         <section className="panel anchorSection" ref={reviewRef}><div className="panelHead"><div><span className="sectionTag amber">REVIEW QUEUE</span><h2>{active ? `${active.pages.filter(p => p.status === "review").length} pages flagged` : "No document selected"}</h2><p>Uncertain values are never guessed or silently accepted.</p></div></div>{!active && <button className="reviewEmpty" onClick={() => inputRef.current?.click()}>Add a PDF to create a review queue</button>}{active?.pages.filter(p => p.status === "review").slice(0, 8).map(p => <div className="reviewItem" key={p.page}><span>PAGE {p.page}</span><strong>CA review required</strong><p>Open this page in the original PDF and verify its important values. It remains excluded from answers.</p></div>)}{active?.status === "Review" && <div className="reviewHelp"><strong>Want another automatic attempt?</strong><p>Select Maximum Verification above and upload the same PDF again. The CA must still check any page that remains flagged.</p></div>}{active && active.pages.every(p => p.status === "read") && active.status !== "Processing" && <div className="reviewItem complete"><span>COMPLETE</span><strong>All pages produced readable text</strong><p>Important values still need professional approval.</p></div>}</section>
