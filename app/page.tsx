@@ -216,7 +216,7 @@ export default function Home() {
     // worker) must never block the whole document forever. Any page whose work
     // doesn't finish within this window is treated the same as a normal OCR
     // failure: sent to CA review, never silently skipped.
-    const PAGE_TIMEOUT_MS = 45_000;
+    const PAGE_TIMEOUT_MS = 90_000;
     function withPageTimeout<T>(promise: Promise<T>, label: string, timeoutMs = PAGE_TIMEOUT_MS): Promise<T> {
         return new Promise((resolve, reject) => {
             const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
@@ -269,11 +269,13 @@ export default function Home() {
             // Its first-use model/WASM download can take minutes on a slow connection - no
             // page may ever wait on that download as part of its own safety timer, or a slow
             // connection would time out every page trying to use it. So initialization is
-            // kicked off once, eagerly, in the background with its own generous budget, and
-            // runPaddle() below never blocks a page on it: if it isn't ready yet, that page
-            // simply proceeds without the second engine, exactly as if it were unavailable.
-            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; chain: Promise<unknown> } = { engine: null, unavailable: false, chain: Promise.resolve() };
-            withPageTimeout((async () => {
+            // kicked off once, eagerly, in the background with its own generous budget. Pages
+            // that need it join that single shared promise (never re-triggering the download)
+            // and wait up to a bounded amount of time for it - long enough that a normal-speed
+            // download is actually used by nearly every page, short enough that no page's own
+            // safety timer is ever put at risk by a slow or stuck download.
+            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; chain: Promise<unknown>; ready: Promise<void> } = { engine: null, unavailable: false, chain: Promise.resolve(), ready: Promise.resolve() };
+            paddleState.ready = withPageTimeout((async () => {
                 try {
                     const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
                         PaddleOCR: {
@@ -281,12 +283,16 @@ export default function Home() {
                         };
                     }>, { PaddleOCR } = await loadPaddle();
                     paddleState.engine = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
+                    console.info("[PaddleOCR] second OCR engine ready");
                 }
-                catch {
+                catch (err) {
                     paddleState.unavailable = true;
+                    console.warn("[PaddleOCR] second OCR engine failed to load - continuing with primary OCR only:", err);
                 }
-            })(), "PaddleOCR init", 120_000).catch(() => { paddleState.unavailable = true; });
+            })(), "PaddleOCR init", 120_000).catch(err => { paddleState.unavailable = true; console.warn("[PaddleOCR] second OCR engine init timed out - continuing with primary OCR only:", err); });
             async function runPaddle(canvas: HTMLCanvasElement) {
+                if (!paddleState.engine && !paddleState.unavailable)
+                    await Promise.race([paddleState.ready, new Promise<void>(resolve => setTimeout(resolve, 25_000))]).catch(() => undefined);
                 if (!paddleState.engine)
                     return { text: "", confidence: 0 };
                 const task = paddleState.chain.then(async () => {
@@ -294,7 +300,8 @@ export default function Home() {
                     if (!engine)
                         return { text: "", confidence: 0 };
                     try {
-                        const [paddleResult] = await withPageTimeout(engine.predict(canvas), "PaddleOCR predict");
+                        const predictJob = engine.predict(canvas); predictJob.catch(() => undefined);
+                        const [paddleResult] = await withPageTimeout(predictJob, "PaddleOCR predict");
                         return normalizePaddleResult(paddleResult?.items ?? []);
                     }
                     catch {
@@ -343,7 +350,7 @@ export default function Home() {
                     try {
                         result = await withPageTimeout((async (): Promise<PageResult> => {
                             const worker = await getSlotWorker(slot);
-                            const firstScale = initial.mode === "fast" ? 1.7 : 2.2, firstCanvas = await renderOcrCanvas(page, firstScale, false), first = await worker.recognize(firstCanvas), firstText = cleanOcrText(first.data.text);
+                            const firstScale = initial.mode === "fast" ? 1.7 : 2.2, firstCanvas = await renderOcrCanvas(page, firstScale, false), firstJob = worker.recognize(firstCanvas); firstJob.catch(() => undefined); const first = await firstJob, firstText = cleanOcrText(first.data.text);
                             const sanity = financialSanity(firstText), structured = hasReliableTransactionStructure(firstText), firstConsistency = transactionConsistency(firstText), fastAccepted = firstText.length >= 20 && sanity.passed && (initial.mode === "fast" ? (first.data.confidence >= 72 || (structured && first.data.confidence >= 45 && firstConsistency >= .97)) : first.data.confidence >= 88);
                             if (fastAccepted) {
                                 firstCanvas.width = 0;
@@ -357,7 +364,7 @@ export default function Home() {
                             if (dualAccepted)
                                 return { page: n, text: firstText, method: "OCR", status: "read", verification: `Dual OCR agreement ${Math.round(crossAgreement * 100)}%; ${sanity.checked} financial values checked` };
                             await worker.setParameters({ tessedit_pageseg_mode: "6" as never, preserve_interword_spaces: "1" });
-                            const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 2.1 : 2.6, true), second = await worker.recognize(enhancedCanvas);
+                            const enhancedCanvas = await renderOcrCanvas(page, initial.mode === "fast" ? 2.1 : 2.6, true), secondJob = worker.recognize(enhancedCanvas); secondJob.catch(() => undefined); const second = await secondJob;
                             enhancedCanvas.width = 0;
                             enhancedCanvas.height = 0;
                             const secondText = cleanOcrText(second.data.text), retryAgreement = tokenAgreement(firstText, secondText), paddleRetryAgreement = Math.max(tokenAgreement(firstText, paddleText), tokenAgreement(secondText, paddleText)), secondConsistency = transactionConsistency(secondText), preferSecond = secondConsistency > firstConsistency || (secondConsistency === firstConsistency && second.data.confidence >= first.data.confidence), best = preferSecond ? second : first, bestText = cleanOcrText(best.data.text), bestSanity = financialSanity(bestText), bestStructured = hasReliableTransactionStructure(bestText), bestConsistency = Math.max(firstConsistency, secondConsistency), legacyAccepted = firstText.length >= 20 && first.data.confidence >= 62 && (!structured || firstConsistency >= .97), retryAccepted = bestText.length >= 20 && ((bestStructured && bestConsistency >= .97 && Math.max(first.data.confidence, second.data.confidence) >= 40) || (Math.max(first.data.confidence, second.data.confidence) >= 55 && retryAgreement >= (bestStructured ? .82 : .9))), verifiedRetry = paddleText.length >= 20 && paddleConfidence >= 68 && paddleRetryAgreement >= .82 && bestSanity.passed, accepted = legacyAccepted || retryAccepted || verifiedRetry;
