@@ -217,9 +217,9 @@ export default function Home() {
     // doesn't finish within this window is treated the same as a normal OCR
     // failure: sent to CA review, never silently skipped.
     const PAGE_TIMEOUT_MS = 45_000;
-    function withPageTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    function withPageTimeout<T>(promise: Promise<T>, label: string, timeoutMs = PAGE_TIMEOUT_MS): Promise<T> {
         return new Promise((resolve, reject) => {
-            const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), PAGE_TIMEOUT_MS);
+            const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
             promise.then(value => { window.clearTimeout(timer); resolve(value); }, error => { window.clearTimeout(timer); reject(error); });
         });
     }
@@ -264,30 +264,29 @@ export default function Home() {
                 return workerPool[slot]!;
             }
 
-            // PaddleOCR is a single shared engine (its own model session), so calls to it
+            // PaddleOCR is a single shared engine (its own model session), so predict calls
             // are serialized through paddleChain even though Tesseract runs in parallel.
-            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; init: Promise<void> | null; chain: Promise<unknown> } = { engine: null, unavailable: false, init: null, chain: Promise.resolve() };
-            function ensurePaddle() {
-                if (paddleState.engine || paddleState.unavailable)
-                    return Promise.resolve();
-                if (!paddleState.init)
-                    paddleState.init = withPageTimeout((async () => {
-                        try {
-                            const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
-                                PaddleOCR: {
-                                    create: (options: Record<string, unknown>) => Promise<PaddleEngine>;
-                                };
-                            }>, { PaddleOCR } = await loadPaddle();
-                            paddleState.engine = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
-                        }
-                        catch {
-                            paddleState.unavailable = true;
-                        }
-                    })(), "PaddleOCR init").catch(() => { paddleState.unavailable = true; });
-                return paddleState.init;
-            }
+            // Its first-use model/WASM download can take minutes on a slow connection - no
+            // page may ever wait on that download as part of its own safety timer, or a slow
+            // connection would time out every page trying to use it. So initialization is
+            // kicked off once, eagerly, in the background with its own generous budget, and
+            // runPaddle() below never blocks a page on it: if it isn't ready yet, that page
+            // simply proceeds without the second engine, exactly as if it were unavailable.
+            const paddleState: { engine: PaddleEngine | null; unavailable: boolean; chain: Promise<unknown> } = { engine: null, unavailable: false, chain: Promise.resolve() };
+            withPageTimeout((async () => {
+                try {
+                    const loadPaddle = new Function("return import('https://esm.sh/@paddleocr/paddleocr-js@0.4.2?bundle')") as () => Promise<{
+                        PaddleOCR: {
+                            create: (options: Record<string, unknown>) => Promise<PaddleEngine>;
+                        };
+                    }>, { PaddleOCR } = await loadPaddle();
+                    paddleState.engine = await PaddleOCR.create({ lang: "en", ocrVersion: "PP-OCRv5", worker: true, textRecognitionBatchSize: 6, ortOptions: { backend: "wasm", wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/", numThreads: 2, simd: true } });
+                }
+                catch {
+                    paddleState.unavailable = true;
+                }
+            })(), "PaddleOCR init", 120_000).catch(() => { paddleState.unavailable = true; });
             async function runPaddle(canvas: HTMLCanvasElement) {
-                await ensurePaddle();
                 if (!paddleState.engine)
                     return { text: "", confidence: 0 };
                 const task = paddleState.chain.then(async () => {
